@@ -1,0 +1,37 @@
+# Derleme ve Geçici Dosyalar
+build/
+install/
+log/
+*.log
+*.tar
+*.iso
+
+# Python & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Docker Geçici Çıktıları
+*.cid
+*.docker-temp
+
+# SITL / Gazebo Kayıtları ve Logları
+dataflash.bin
+*.bin
+eeprom.bin
+mav.parm
+terrain/
+logs/
+
+# IDE / Editör Ayarları
+.vscode/
+.idea/
+*.swp
+*~
+
+# Büyük Model Ağırlıkları (.pt, .engine, .onnx repoya atılmaz)
+*.pt
+*.engine
+*.onnx
+weights/
