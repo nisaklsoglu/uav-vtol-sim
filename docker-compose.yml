@@ -1,0 +1,17 @@
+services:
+  vtol_sim:
+    container_name: vtol_sim
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: uav-vtol-sim:latest
+    platform: linux/arm64
+    network_mode: host
+    ipc: host
+    environment:
+      - DISPLAY=host.docker.internal:0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

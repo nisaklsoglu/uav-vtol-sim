@@ -35,3 +35,9 @@ logs/
 *.engine
 *.onnx
 weights/
+
+.DS_Store
+*.tlog
+*.rlog
+mav.parm
+*.pyc
