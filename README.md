@@ -36,7 +36,7 @@ sudo apt-get update && sudo apt-get install -y \
   python3-gz-msgs10 \
   ros-humble-sensor-msgs \
   ros-humble-rqt-image-view
-
+```
 ## 🚀 Kurulum
 
 ### 1. Depoyu Klonlama ve Konteyneri Başlatma
@@ -188,7 +188,7 @@ Kamera akışını ve frekansını doğrulamak için:
 ```bash
 ros2 topic hz /camera/image_raw
 ros2 run rqt_image_view rqt_image_view /camera/image_raw
-'''
+```
 ## 🎮 Uçuş Testleri
 
 Aşağıdaki komutlar MAVProxy (`MAV>`) konsolunda çalıştırılır.
