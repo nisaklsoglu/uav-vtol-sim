@@ -28,6 +28,14 @@ Bu proje, dikey kalkış ve iniş (VTOL), sabit kanatlı ileri uçuş, uçuş mo
 - Apple Silicon tabanlı bir Mac veya ARM64 Ubuntu ortamı
 
 > **Not:** ROS 2 Humble, Gazebo Harmonic ve `ardupilot_gazebo` eklentisinin aynı ortamda uyumlu çalışması için konteyner imajının ilgili bağımlılıkları doğru şekilde yapılandırılmış olmalıdır.
+> Kamera köprüsünün çalışabilmesi için konteyner içinde şu paketlerin kurulu olması gerekir:
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  python3-gz-transport13 \
+  python3-gz-msgs10 \
+  ros-humble-sensor-msgs \
+  ros-humble-rqt-image-view
 
 ## 🚀 Kurulum
 
@@ -108,6 +116,12 @@ Simülasyonun doğru başlatılması için Gazebo ve ArduPilot SITL ayrı termin
 docker exec -it vtol_sim bash
 ```
 
+> **Not (GPU / Donanımsal Render Yoksa):** Docker ortamında GPU erişim izni yoksa (`Permission denied` hatası alınıyorsa) Gazebo'nun pikselleri üretebilmesi için yazılımsal CPU render açılmalıdır. Harici GPU kullananların bu adımı yapmasına gerek yoktur:
+> ```bash
+> export LIBGL_ALWAYS_SOFTWARE=1
+> export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+> ```
+
 Gazebo model ve eklenti yollarını tanımlayın:
 
 ```bash
@@ -160,6 +174,21 @@ Bu komut, QuadPlane konfigürasyonunu kullanarak ArduPilot SITL'yi başlatır ve
 
 Başlatma tamamlandığında MAVProxy konsolu üzerinden uçuş modları ve RC kanalları kontrol edilebilir.
 
+### Terminal 3 – Kamera Köprüsü (Camera Bridge)
+
+Kameranın ROS 2'ye aktarılması için yeni bir terminalde köprüyü çalıştırın:
+
+```bash
+docker exec -it vtol_sim bash
+source /opt/ros/humble/setup.bash
+python3 scripts/camera_bridge.py
+'''
+Kamera akışını ve frekansını doğrulamak için:
+
+```bash
+ros2 topic hz /camera/image_raw
+ros2 run rqt_image_view rqt_image_view /camera/image_raw
+'''
 ## 🎮 Uçuş Testleri
 
 Aşağıdaki komutlar MAVProxy (`MAV>`) konsolunda çalıştırılır.
