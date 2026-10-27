@@ -1,0 +1,10 @@
+# SITL bringup overrides (loaded last via --add-param-file; use -w to wipe EEPROM)
+ARMING_CHECK      0
+BRD_SAFETYENABLE  0
+BRD_SAFETY_DEFLT  0
+DISARM_DELAY      0
+FS_GCS_ENABLE     0
+FS_LONG_ACT       0
+FS_SHORT_ACT      0
+LOG_BACKEND_TYPE  0
+SCHED_LOOP_RATE   200

@@ -1,5 +1,6 @@
 import os
 from glob import glob
+
 from setuptools import setup
 
 package_name = 'vtol_bringup'
@@ -12,6 +13,9 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*')),
+        (os.path.join('share', package_name, 'worlds'), glob('worlds/*')),
+        (os.path.join('share', package_name, 'scripts'), glob('scripts/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,6 +24,8 @@ setup(
     description='VTOL Multi-Agent Simulation Bringup',
     license='Apache License 2.0',
     entry_points={
-        'console_scripts': [],
+        'console_scripts': [
+            'multi_vtol_commander = vtol_bringup.multi_vtol_commander:main',
+        ],
     },
 )

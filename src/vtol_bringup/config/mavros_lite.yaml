@@ -1,0 +1,23 @@
+/**:
+  ros__parameters:
+    # Disable automatic FCU parameter pull / flood at connection.
+    # Also drop heavy plugins that are unused for dual-VTOL bringup.
+    plugin_denylist:
+      - param
+      - ftp
+      - mission
+      - actuator_control
+      - hil
+      - image_pub
+      - px4flow
+      - vibration
+      - wheel_odometry
+      - vision_speed_estimate
+      - debug_value
+      - altitude
+
+/**/time:
+  ros__parameters:
+    timesync_mode: NONE
+    timesync_rate: 0.0
+    system_time_rate: 0.0

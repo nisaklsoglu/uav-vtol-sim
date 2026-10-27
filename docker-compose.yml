@@ -15,6 +15,7 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ${XDG_RUNTIME_DIR:-/tmp}/${WAYLAND_DISPLAY:-wayland-0}:/tmp/wayland-0:ro
+      - ./src:/home/uav/ros2_ws/src:rw
     stdin_open: true
     tty: true
     restart: unless-stopped
