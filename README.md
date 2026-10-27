@@ -1,345 +1,303 @@
-# 🚁 ArduPilot SITL – VTOL Simulation Environment
+# Çoklu Ajanlı VTOL Simülasyon Altyapısı
+### Gazebo Harmonic · ArduPilot SITL · ROS 2 Humble · MAVROS
 
-Apple Silicon (ARM64) ve Ubuntu üzerinde native olarak çalışan, **ArduPilot SITL (ArduPlane – QuadPlane)**, **Gazebo Harmonic (GZ Sim 8)** ve **ROS 2 Humble** tabanlı otonom VTOL İHA simülasyon ortamı.
+Bu depo, **Gazebo Harmonic (GZ Sim 8)** üzerinde iki bağımsız VTOL (QuadPlane) modelinin fizik simülasyonunu, ArduPilot SITL otopilot süreçlerini ve ROS 2 Humble üzerindeki bağımsız MAVROS telemetri ve kontrol köprülerini tek bir komutla başlatan simülasyon altyapısını içerir.
 
-Bu proje, dikey kalkış ve iniş (VTOL), sabit kanatlı ileri uçuş, uçuş modu geçişleri ve ROS 2 üzerinden sensör verilerinin aktarılması gibi temel otonom uçuş senaryolarını simüle etmek amacıyla geliştirilmiştir.
+Sistem, iki İHA'nın birbirinden bağımsız şekilde çalışmasını sağlayarak çoklu ajan kontrol algoritmalarının, otonom görev planlayıcılarının ve sürü yazılımlarının geliştirilmesi ve test edilmesi için bir ortam sunar.
 
-## 🛠️ Mimari ve Bileşenler
+---
 
-| Bileşen | Teknoloji |
-|---|---|
-| İşletim Sistemi | Ubuntu 22.04 LTS (`linux/arm64`) |
-| Robotik Middleware | ROS 2 Humble Hawksbill |
-| Fizik Simülatörü | Gazebo Harmonic (GZ Sim 8.x) |
-| Fizik Motoru | DART Physics |
-| Uçuş Kontrol Yazılımı | ArduPilot SITL – ArduPlane |
-| İHA Konfigürasyonu | QuadPlane VTOL |
-| VTOL Modeli | `alti_transition_quad` |
-| Gazebo – ArduPilot Haberleşmesi | `ardupilot_gazebo` JSON/Lockstep UDP |
-| Yer Kontrol ve Telemetri | MAVProxy |
-| ROS 2 – Gazebo Köprüsü | `ros_gz_bridge` |
+## 1. Mimari ve Ağ Yapısı
 
-## 📋 Gereksinimler
+Her iki İHA da bağımsız ArduPilot SITL instance'ları olarak çalıştırılır. MAVROS köprüleri, TCP bağlantıları üzerinden ilgili otopilotlarla iletişim kurarak telemetri ve kontrol arayüzlerini ROS 2 ekosistemine aktarır.
 
-- Ubuntu 22.04 LTS (`linux/arm64`)
-- Docker Engine
-- Docker Compose
-- Git
-- Apple Silicon tabanlı bir Mac veya ARM64 Ubuntu ortamı
+### İHA yapılandırması
 
-> **Not:** ROS 2 Humble, Gazebo Harmonic ve `ardupilot_gazebo` eklentisinin aynı ortamda uyumlu çalışması için konteyner imajının ilgili bağımlılıkları doğru şekilde yapılandırılmış olmalıdır.
+| Parametre | VTOL 1 | VTOL 2 |
+|---|---|---|
+| Gazebo model adı | `vtol_1` | `vtol_2` |
+| SITL instance | `-I0` | `-I1` |
+| Gazebo JSON portu | `9002` | `9012` |
+| MAVROS bağlantı URL'i | `tcp://127.0.0.1:5762` | `tcp://127.0.0.1:5773` |
+| Target System ID | `1` | `1` |
+| ROS 2 namespace | `/vtol_1` | `/vtol_2` |
 
-## 🚀 Kurulum
+### Başlatma sıralaması
 
-### 1. Depoyu Klonlama ve Konteyneri Başlatma
+ArduPilot SITL'in TCP sunucusunu başlatması ve EKF sensör hizalamasını tamamlaması yaklaşık **10–12 saniye** sürebilir.
 
-```bash
-git clone <REPO_URL>
-cd uav-vtol-sim
-docker compose up -d
-```
+`Connection refused` ve `link down` gibi bağlantı hatalarını önlemek amacıyla MAVROS düğümleri, launch dosyasında `TimerAction` kullanılarak 12 saniye gecikmeli başlatılır.
 
-Konteynerin çalıştığını kontrol edin:
+> **Not:** Başlatma gecikmesi, SITL'in her koşulda hazır olduğunu garanti etmez. Daha sağlam bir yapı için bağlantı ve araç hazır olma durumlarının kontrol edilmesi önerilir.
 
-```bash
-docker ps
-```
+---
 
-Konteyner adı `vtol_sim` olarak yapılandırılmışsa aşağıdaki komutla terminale bağlanabilirsiniz:
+## 2. Ön Koşullar ve Bağımlılıklar
 
-```bash
-docker exec -it vtol_sim bash
-```
+Simülasyonu çalıştırmadan önce Docker konteynerinde aşağıdaki bileşenlerin kurulu ve yapılandırılmış olduğundan emin olun:
 
-### 2. VTOL Modelini İndirme
+- Gazebo Harmonic (GZ Sim 8)
+- ArduPilot SITL
+- ROS 2 Humble
+- MAVROS
+- MAVROS mesaj paketleri
+- GeographicLib veri setleri
+- `colcon` derleme araçları
+- `vtol_bringup` ROS 2 paketi
 
-İlk kurulumda resmi ArduPilot SITL_Models deposundan `alti_transition_quad` modelini indirin.
+### MAVROS kurulumu
 
-Konteynere girdikten sonra:
+Konteyner içerisinde aşağıdaki komutları çalıştırın:
 
 ```bash
-cd /home/uav/ardupilot_gazebo/models
+sudo apt-get update
 
-git clone --depth 1 --filter=blob:none --sparse \
-  https://github.com/ArduPilot/SITL_Models.git sitl_models_tmp
+sudo apt-get install -y \
+    ros-humble-mavros \
+    ros-humble-mavros-msgs
 
-cd sitl_models_tmp
-
-git sparse-checkout set Gazebo/models/alti_transition_quad
-
-cp -r Gazebo/models/alti_transition_quad \
-  /home/uav/ardupilot_gazebo/models/
-
-cd /home/uav/ardupilot_gazebo/models
-
-rm -rf sitl_models_tmp
+sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh
 ```
 
-Bu işlem, gerekli VTOL modelini `ardupilot_gazebo/models` dizinine yerleştirir.
+---
 
-### 3. QuadPlane Pist Dünyasını Oluşturma
+## 3. Kurulum ve Çalıştırma
 
-Mevcut `iris_runway.sdf` dünyasını temel alarak VTOL modelini kullanacak yeni bir dünya dosyası oluşturun:
+Simülasyon ortamı, `vtol_sim` isimli Docker konteyneri içerisinde çalıştırılır.
 
-```bash
-cd /home/uav/ardupilot_gazebo/worlds
+### Adım 1: Docker konteynerine bağlanma
 
-sed 's|model://iris_with_gimbal|model://alti_transition_quad|g' \
-  iris_runway.sdf > quadplane_runway.sdf
-```
-
-Oluşturulan dünya dosyası:
-
-```text
-/home/uav/ardupilot_gazebo/worlds/quadplane_runway.sdf
-```
-
-> **Önemli:** Bu işlem yalnızca model URI değerlerini değiştirir. Dünya dosyasının geri kalanında modelin bağlantı noktaları, sensörleri ve eklenti yapılandırmalarıyla ilgili ek değişiklikler gerekebilir.
-
-## 🛫 Simülasyonu Çalıştırma
-
-Simülasyonun doğru başlatılması için Gazebo ve ArduPilot SITL ayrı terminallerde çalıştırılmalıdır.
-
-### Terminal 1 – Gazebo Harmonic
-
-Öncelikle konteynere bağlanın:
+Host makinede terminal açın ve konteynere bağlanın:
 
 ```bash
 docker exec -it vtol_sim bash
 ```
 
-Gazebo model ve eklenti yollarını tanımlayın:
+### Adım 2: ROS 2 çalışma alanını derleme
+
+Konteyner içerisinde aşağıdaki komutları çalıştırın:
 
 ```bash
-export GZ_SIM_RESOURCE_PATH=/home/uav/ardupilot_gazebo/models:/home/uav/ardupilot_gazebo/worlds:$GZ_SIM_RESOURCE_PATH
+cd /home/uav/ros2_ws
 
-export GZ_SIM_SYSTEM_PLUGIN_PATH=/home/uav/ardupilot_gazebo/build:$GZ_SIM_SYSTEM_PLUGIN_PATH
+source /opt/ros/humble/setup.bash
+
+colcon build --packages-select vtol_bringup
+
+source install/setup.bash
 ```
 
-**Headless (GUI olmadan) çalıştırma:**
+> **Not:** Bu derleme işleminin ilk kurulumda veya `vtol_bringup` paketinde değişiklik yapıldığında gerçekleştirilmesi gerekir.
 
-```bash
-gz sim -v 4 -r -s \
-  /home/uav/ardupilot_gazebo/worlds/quadplane_runway.sdf
-```
+### Adım 3: Simülasyonu başlatma
 
-**Grafik arayüzüyle çalıştırma:**
-
-Host ekran erişimi ve grafik arayüzü yönlendirmesi yapılandırıldıktan sonra:
-
-```bash
-gz sim -v 4 -r \
-  /home/uav/ardupilot_gazebo/worlds/quadplane_runway.sdf
-```
-
-### Terminal 2 – ArduPilot SITL ve MAVProxy
-
-İkinci bir terminal açın:
-
-```bash
-docker exec -it vtol_sim bash
-```
-
-ArduPlane dizinine geçin:
-
-```bash
-cd /home/uav/ardupilot/ArduPlane
-```
-
-SITL simülasyonunu başlatın:
-
-```bash
-DISPLAY= sim_vehicle.py \
-  -v ArduPlane \
-  -f quadplane \
-  --model JSON:127.0.0.1 \
-  --no-rebuild
-```
-
-Bu komut, QuadPlane konfigürasyonunu kullanarak ArduPilot SITL'yi başlatır ve Gazebo ile JSON tabanlı bağlantı kurmayı hedefler.
-
-Başlatma tamamlandığında MAVProxy konsolu üzerinden uçuş modları ve RC kanalları kontrol edilebilir.
-
-## 🎮 Uçuş Testleri
-
-Aşağıdaki komutlar MAVProxy (`MAV>`) konsolunda çalıştırılır.
-
-### 1. Dikey Kalkış – QLOITER
-
-Dikey kalkış ve konum koruma moduna geçin:
-
-```text
-mode QLOITER
-arm throttle
-rc 3 1700
-```
-
-İstenen irtifaya ulaşıldığında gaz kanalını nötr seviyeye yaklaştırın:
-
-```text
-rc 3 1500
-```
-
-### 2. Sabit Kanatlı İleri Uçuş – FBWA
-
-İleri uçuş moduna geçin:
-
-```text
-mode FBWA
-rc 3 1750
-```
-
-Bu aşamada araç, uygun uçuş koşulları sağlandığında dikey uçuş konfigürasyonundan sabit kanatlı ileri uçuşa geçmeyi hedefler.
-
-> **Not:** Geçiş davranışı; hava hızı, uçuş kontrol parametreleri, servo ve motor eşleştirmeleri ile QuadPlane konfigürasyonuna bağlıdır. Dikey motorların kapanması ve itici motorun devreye girmesi her konfigürasyonda yalnızca bu komutlarla garanti edilmez.
-
-### 3. Dikey İniş – QLAND
-
-Dikey iniş moduna geçin:
-
-```text
-mode QLAND
-```
-
-Araç inişini tamamladıktan ve motorlar güvenli biçimde durduktan sonra, gerekli koşullar sağlanıyorsa:
-
-```text
-rc 3 1000
-mode MANUAL
-disarm
-```
-
-> **Güvenlik:** RC kanal değerleri simülasyon yapılandırmasına göre değişebilir. Mod geçişlerini ve motor davranışlarını doğrulamadan bu komutları gerçek bir araçta kullanmayın.
-
-## 🔌 ROS 2 Entegrasyonu
-
-Gazebo'da üretilen IMU ve odometri verilerini ROS 2 ekosistemine aktarmak için `ros_gz_bridge` kullanılabilir.
-
-### 1. ROS 2 Ortamını Hazırlama
-
-Yeni bir terminalde konteynere bağlanın:
-
-```bash
-docker exec -it vtol_sim bash
-```
-
-ROS 2 Humble ortamını etkinleştirin:
+Simülasyonu başlatmak için aynı konteyner terminalinde şu komutları çalıştırın:
 
 ```bash
 source /opt/ros/humble/setup.bash
+
+source /home/uav/ros2_ws/install/setup.bash
+
+export GZ_IP=127.0.0.1
+
+ros2 launch vtol_bringup sim.launch.py
 ```
 
-### 2. IMU ve Odometri Köprüsünü Başlatma
+Bu launch dosyası yapılandırmasına bağlı olarak aşağıdaki bileşenler başlatılır:
+
+- Gazebo simülasyon ortamı
+- `vtol_1` için ArduPlane SITL instance'ı
+- `vtol_2` için ArduPlane SITL instance'ı
+- Her İHA için bağımsız MAVROS bağlantısı
+- ROS 2 üzerinden telemetri ve kontrol arayüzleri
+
+---
+
+## 4. Telemetri ve Veri Akışını Doğrulama
+
+Simülasyon çalışırken yeni bir host terminali açın ve ikinci terminali konteynere bağlayın:
 
 ```bash
-ros2 run ros_gz_bridge parameter_bridge \
-  /world/iris_runway/model/alti_transition_quad/link/imu_link/sensor/imu_sensor/imu@sensor_msgs/msg/Imu[gz.msgs.IMU \
-  /model/alti_transition_quad/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry
+docker exec -it vtol_sim bash
 ```
 
-Bu komut, belirtilen Gazebo topic'lerini ilgili ROS 2 mesaj türleriyle eşleştirmeyi amaçlar.
+ROS 2 ortamını yükleyin:
 
-**Önemli:** Topic isimleri, gerçek dünyadaki model ve sensör isimleriyle birebir eşleşmelidir. Yukarıdaki topic yolları örnek yapılandırmadaki isimlere bağlıdır; farklı bir SDF dosyasında değişiklik gerekebilir.
+```bash
+source /opt/ros/humble/setup.bash
 
-### 3. Topic'leri Kontrol Etme
+source /home/uav/ros2_ws/install/setup.bash
+```
 
-ROS 2 topic listesini görüntüleyin:
+### VTOL 1 bağlantı kontrolü
+
+```bash
+ros2 topic echo /vtol_1/mavros/state --once
+```
+
+Beklenen temel alanlar:
+
+```yaml
+connected: true
+mode: FBWA
+```
+
+`connected: true` değeri, MAVROS'un otopilot bağlantısını algıladığını gösterir. `FBWA` ise beklenen başlangıç uçuş modu olarak belirtilmiştir; gerçek değer yapılandırmaya ve mevcut uçuş durumuna bağlıdır.
+
+Yerel konum verisini kontrol edin:
+
+```bash
+ros2 topic echo /vtol_1/mavros/global_position/local --once
+```
+
+### VTOL 2 bağlantı kontrolü
+
+```bash
+ros2 topic echo /vtol_2/mavros/state --once
+```
+
+Beklenen temel alanlar:
+
+```yaml
+connected: true
+mode: FBWA
+```
+
+Yerel konum verisini kontrol edin:
+
+```bash
+ros2 topic echo /vtol_2/mavros/global_position/local --once
+```
+
+> **Önemli:** Topic isimleri ve mesaj türleri kullanılan MAVROS yapılandırmasıyla eşleşmelidir. Bağlantı veya veri akışı sorunu yaşanırsa `ros2 topic list` ve `ros2 topic info` komutlarıyla mevcut topic'leri ve mesaj türlerini doğrulayın.
+
+---
+
+## 5. Otonom Kontrol ve Sürü Yazılımı Arayüzleri
+
+Sürü algoritmaları ve otonom görev planlayıcıları, her İHA'ya kendi ROS 2 namespace'i üzerinden erişebilir.
+
+### 5.1. Temel topic'ler
+
+| İşlev | VTOL 1 | VTOL 2 |
+|---|---|---|
+| Yerel konum / odometri | `/vtol_1/mavros/global_position/local` | `/vtol_2/mavros/global_position/local` |
+| Küresel GPS konumu | `/vtol_1/mavros/global_position/global` | `/vtol_2/mavros/global_position/global` |
+| Yerel hedef konumu | `/vtol_1/mavros/setpoint_position/local` | `/vtol_2/mavros/setpoint_position/local` |
+
+| Topic | Mesaj türü |
+|---|---|
+| `mavros/global_position/local` | `nav_msgs/msg/Odometry` |
+| `mavros/global_position/global` | `sensor_msgs/msg/NavSatFix` |
+| `mavros/setpoint_position/local` | `geometry_msgs/msg/PoseStamped` |
+
+Topic isimleri, namespace'in önüne eklenmesiyle her İHA için bağımsız hale gelir.
+
+### 5.2. Temel servisler
+
+| İşlev | VTOL 1 | VTOL 2 |
+|---|---|---|
+| Motorları başlatma / durdurma (Arm/Disarm) | `/vtol_1/mavros/cmd/arming` | `/vtol_2/mavros/cmd/arming` |
+| Uçuş modu değiştirme | `/vtol_1/mavros/set_mode` | `/vtol_2/mavros/set_mode` |
+
+| Servis | Mesaj türü |
+|---|---|
+| `mavros/cmd/arming` | `mavros_msgs/srv/CommandBool` |
+| `mavros/set_mode` | `mavros_msgs/srv/SetMode` |
+
+Uçuş modu değiştirme servisi üzerinden `GUIDED`, `QLOITER` veya araç tarafından desteklenen diğer uygun modlar talep edilebilir. Modun başarıyla değişmesi, ArduPilot'un uçuş koşullarına ve mod gereksinimlerine bağlıdır.
+
+### 5.3. Kullanım örnekleri
+
+VTOL 1'in durumunu sorgulama:
+
+```bash
+ros2 topic echo /vtol_1/mavros/state
+```
+
+VTOL 2'nin GPS verisini izleme:
+
+```bash
+ros2 topic echo /vtol_2/mavros/global_position/global
+```
+
+VTOL 1 için mevcut arming servis arayüzünü inceleme:
+
+```bash
+ros2 service info /vtol_1/mavros/cmd/arming
+```
+
+Mevcut topic ve servisleri listeleme:
 
 ```bash
 ros2 topic list
+ros2 service list
 ```
 
-IMU topic'inin verilerini kontrol edin:
+> **Kontrol notu:** `setpoint_position/local` üzerinden hedef gönderirken uygun uçuş modunun etkin olması, setpoint mesajlarının gerekli hızda yayımlanması ve koordinat çerçevelerinin doğru kullanılması gerekir. Yalnızca topic'e mesaj göndermek, İHA'nın hedefe uçacağını garanti etmez.
+
+---
+
+## 6. Simülasyonu Durdurma ve Süreç Temizliği
+
+Simülasyon terminalinde `Ctrl + C` kullanarak launch sürecini durdurun.
+
+Sonraki çalıştırmalarda `Address already in use` veya `Connection refused` gibi hatalarla karşılaşılması durumunda, konteyner içerisinde kalan süreçleri kontrol edin.
+
+### Süreçleri temizleme
+
+Aşağıdaki komut, belirtilen süreçleri zorla sonlandırır:
 
 ```bash
-ros2 topic echo /world/iris_runway/model/alti_transition_quad/link/imu_link/sensor/imu_sensor/imu
+killall -9 gz sim_vehicle.py arduplane mavros_node parameter_bridge 2>/dev/null || true
 ```
 
-Odometri topic'ini kontrol etmek için:
+> **Uyarı:** Bu komut, aynı isimli süreçlerin tümünü sonlandırabilir. Aynı konteynerde başka bir simülasyon çalışıyorsa bu süreçleri de etkileyebilir. Gerektiğinde önce `ps` veya `pgrep` ile çalışan süreçleri kontrol edin.
+
+### Hızlı yeniden başlatma
+
+Temizliğin ardından simülasyonu yeniden başlatmak için:
 
 ```bash
-ros2 topic echo /model/alti_transition_quad/odometry
+killall -9 gz sim_vehicle.py arduplane mavros_node parameter_bridge 2>/dev/null || true
+
+source /opt/ros/humble/setup.bash
+
+source /home/uav/ros2_ws/install/setup.bash
+
+export GZ_IP=127.0.0.1
+
+ros2 launch vtol_bringup sim.launch.py
 ```
 
-Topic isimlerini, kendi Gazebo ve ROS 2 yapılandırmanızla karşılaştırarak doğrulayın.
+---
 
-## 🧪 Temel Test Senaryoları
+## 7. Sorun Giderme
 
-| Test | Amaç |
+| Hata / Belirti | Kontrol edilmesi gerekenler |
 |---|---|
-| Gazebo başlatma | Fizik simülasyonunun doğru çalıştığını doğrulamak |
-| SITL bağlantısı | ArduPilot ile Gazebo arasındaki JSON bağlantısını kontrol etmek |
-| Dikey kalkış | QLOITER modunda kontrollü kalkışı test etmek |
-| İleri uçuş | FBWA moduna geçişi değerlendirmek |
-| Dikey iniş | QLAND modundaki iniş davranışını test etmek |
-| IMU aktarımı | Gazebo sensör verilerinin ROS 2'ye ulaştığını doğrulamak |
-| Odometri aktarımı | Konum ve hareket bilgilerinin ROS 2'ye ulaştığını doğrulamak |
+| `Connection refused` | SITL sürecinin çalıştığını, TCP portlarının dinlendiğini ve MAVROS bağlantı URL'lerinin doğru olduğunu kontrol edin. |
+| `link down` | SITL'in başlatılma süresini, TCP bağlantısını ve MAVROS loglarını kontrol edin. |
+| `connected: false` | İlgili MAVROS instance'ının doğru SITL portuna bağlandığını doğrulayın. |
+| Yerel konum verisi gelmiyor | İlgili topic'in varlığını, mesaj akışını ve EKF/GPS durumunu kontrol edin. |
+| `Address already in use` | İlgili portu kullanan süreçleri belirleyin ve yalnızca gerekli süreçleri sonlandırın. |
+| Uçuş modu değişmiyor | İstenen modun araç tarafından desteklendiğini ve geçiş koşullarının sağlandığını kontrol edin. |
+| Paket bulunamıyor | Çalışma alanını yeniden derleyin ve `install/setup.bash` dosyasını kaynak olarak yükleyin. |
 
-## 🐛 Sorun Giderme
+---
 
-### Gazebo modeli bulunamıyor
+## 8. Projenin Amacı
 
-Model ve dünya yollarını kontrol edin:
+Bu altyapı, çoklu VTOL sistemlerinin simülasyon ortamında geliştirilmesini ve test edilmesini kolaylaştırmak amacıyla tasarlanmıştır.
 
-```bash
-echo "$GZ_SIM_RESOURCE_PATH"
-```
+Başlıca kullanım alanları:
 
-Gerekirse model yolunu yeniden tanımlayın:
+- Çoklu İHA telemetrisi ve durum takibi
+- Bağımsız araç kontrolü
+- Otonom görev planlama
+- Sürü koordinasyonu ve çoklu ajan algoritmaları
+- ROS 2 tabanlı kontrol yazılımlarının geliştirilmesi
+- Simülasyon ortamında uçuş senaryolarının test edilmesi
 
-```bash
-export GZ_SIM_RESOURCE_PATH=/home/uav/ardupilot_gazebo/models:/home/uav/ardupilot_gazebo/worlds:$GZ_SIM_RESOURCE_PATH
-```
+**Temel hedef:** İki bağımsız VTOL aracının Gazebo, ArduPilot SITL ve ROS 2/MAVROS entegrasyonu üzerinden tek bir simülasyon ortamında çalıştırılması ve merkezi bir yazılım tarafından koordine edilebilmesidir.
 
-### SITL, Gazebo'ya bağlanamıyor
-
-- Gazebo simülasyonunun çalıştığını kontrol edin.
-- `ardupilot_gazebo` sistem eklentisinin doğru yüklendiğini doğrulayın.
-- JSON/UDP bağlantı adresini ve port yapılandırmasını kontrol edin.
-- Gazebo ve SITL'nin aynı ağ yapılandırmasında erişilebilir olduğundan emin olun.
-
-### ROS 2 topic'leri görünmüyor
-
-- `source /opt/ros/humble/setup.bash` komutunun çalıştırıldığını doğrulayın.
-- `ros_gz_bridge` paketinin kurulu olduğunu kontrol edin.
-- Gazebo topic isimlerini doğrulayın.
-- Bridge komutundaki Gazebo ve ROS 2 mesaj türlerinin eşleştiğinden emin olun.
-
-## 📁 Proje Dizin Yapısı
-
-Beklenen temel dizin yapısı:
-
-```text
-uav-vtol-sim/
-├── docker-compose.yml
-├── README.md
-└── ...
-```
-
-Konteyner içindeki ilgili dizinler:
-
-```text
-/home/uav/
-├── ardupilot/
-│   └── ArduPlane/
-└── ardupilot_gazebo/
-    ├── models/
-    │   └── alti_transition_quad/
-    ├── worlds/
-    │   ├── iris_runway.sdf
-    │   └── quadplane_runway.sdf
-    └── build/
-```
-
-## 📚 Referanslar
-
-- [ArduPilot Documentation](https://ardupilot.org/)
-- [ArduPilot SITL_Models](https://github.com/ArduPilot/SITL_Models)
-- [ArduPilot Gazebo Plugin](https://github.com/ArduPilot/ardupilot_gazebo)
-- [Gazebo Harmonic Documentation](https://gazebosim.org/docs/harmonic/)
-- [ROS 2 Humble Documentation](https://docs.ros.org/en/humble/)
-- [ros_gz Repository](https://github.com/gazebosim/ros_gz)
-
-## 📄 Lisans
-
-Bu projenin lisansı, proje deposunda belirtilen lisans koşullarına tabidir. Kullanılan üçüncü taraf yazılımlar kendi lisansları kapsamında dağıtılmaktadır.
