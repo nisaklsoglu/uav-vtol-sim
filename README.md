@@ -301,3 +301,15 @@ Başlıca kullanım alanları:
 
 **Temel hedef:** İki bağımsız VTOL aracının Gazebo, ArduPilot SITL ve ROS 2/MAVROS entegrasyonu üzerinden tek bir simülasyon ortamında çalıştırılması ve merkezi bir yazılım tarafından koordine edilebilmesidir.
 
+
+---
+
+## Kamera Entegrasyonu
+
+Kamera entegrasyonuna ait kurulum ve kullanım bilgileri:
+
+- [Kamera Dokümantasyonu](docs/README_camera.md)
+- [Çoklu VTOL Dokümantasyonu](docs/README_multi_agent.md)
+
+Not: Kamera özelliklerinin iki VTOL ile birlikte çalışması
+entegrasyon testleri tamamlandıktan sonra doğrulanacaktır.
