@@ -49,3 +49,64 @@ prepare_one() {
 prepare_one "vtol_1" "9002"
 prepare_one "vtol_2" "9012"
 echo "[prepare_dual_vtol_models] models ready under ${DST_BASE}"
+
+# VTOL_CAMERA_INTEGRATION_V1
+# Add a separate camera to each generated VTOL model.
+python3 - "$DST_BASE" <<'PY_CAMERA'
+from pathlib import Path
+import xml.etree.ElementTree as ET
+import copy
+import re
+import sys
+
+models_dir = Path(sys.argv[1])
+
+camera_file = Path(
+    "/home/uav/ros2_ws/src/vtol_bringup/config/camera_sensor.xml"
+)
+
+camera_template = ET.parse(camera_file).getroot()
+
+for name in ("vtol_1", "vtol_2"):
+    model_file = models_dir / name / "model.sdf"
+    sdf = model_file.read_text()
+
+    match = re.search(
+        r'<link\b[^>]*name="base_link"[^>]*>',
+        sdf
+    )
+
+    if not match:
+        raise RuntimeError(f"{name}: base_link bulunamadı")
+
+    position = sdf.find("</link>", match.end())
+
+    if position == -1:
+        raise RuntimeError(f"{name}: link kapanışı bulunamadı")
+
+    camera = copy.deepcopy(camera_template)
+    camera.set("name", "front_camera")
+
+    topic = camera.find("topic")
+
+    if topic is None:
+        topic = ET.SubElement(camera, "topic")
+
+    topic.text = f"/{name}/camera/image_raw"
+
+    camera_xml = ET.tostring(camera, encoding="unicode")
+
+    modified = (
+        sdf[:position]
+        + "\n"
+        + camera_xml
+        + "\n"
+        + sdf[position:]
+    )
+
+    ET.fromstring(modified)
+    model_file.write_text(modified)
+
+    print(f"[camera] {name}: {topic.text}")
+PY_CAMERA
+

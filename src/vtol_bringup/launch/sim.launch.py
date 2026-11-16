@@ -69,6 +69,7 @@ def generate_launch_description():
         cmd=[
             *sitl_common,
             '-I0',
+            '--sysid', '1',
             '--model', 'JSON:127.0.0.1:9002',
         ],
         output='screen',
@@ -78,13 +79,13 @@ def generate_launch_description():
         cmd=[
             *sitl_common,
             '-I1',
+            '--sysid', '2',
             '--model', 'JSON:127.0.0.1:9012',
         ],
         output='screen',
     )
 
     mavros_common = {
-        'target_system_id': 1,
         'target_component_id': 1,
         'plugin_denylist': [
             'param',
@@ -113,6 +114,8 @@ def generate_launch_description():
                     mavros_params,
                     {
                         **mavros_common,
+                        'tgt_system': 1,
+                        'target_system_id': 1,
                         'fcu_url': 'tcp://127.0.0.1:5762',
                     },
                 ],
@@ -126,6 +129,8 @@ def generate_launch_description():
                     mavros_params,
                     {
                         **mavros_common,
+                        'tgt_system': 2,
+                        'target_system_id': 2,
                         'fcu_url': 'tcp://127.0.0.1:5772',
                     },
                 ],
@@ -146,10 +151,27 @@ def generate_launch_description():
         ],
     )
 
+
+    # VTOL_CAMERA_LAUNCH_V1
+    # Start the ROS 2 camera bridge automatically.
+    camera_bridge = TimerAction(
+        period=5.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'python3',
+                    '/home/uav/ros2_ws/src/vtol_bringup/scripts/dual_camera_bridge.py',
+                ],
+                output='screen',
+            ),
+        ],
+    )
+
     return LaunchDescription([
         *env_actions,
         prepare_models,
         gz_sim,
+        camera_bridge,
         sitl_vtol_1,
         sitl_vtol_2,
         delayed_mavros,
