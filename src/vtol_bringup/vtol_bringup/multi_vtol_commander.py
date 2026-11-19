@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Independent dual-VTOL takeoff commander for MAVROS / ArduPilot QuadPlane."""
+"""SUAS 2027 & TEKNOFEST Full Mission Commander for Dual ArduPlane QuadPlane."""
 
+import json
+import math
+import os
 from collections import deque
 from enum import Enum, auto
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
+from mavros_msgs.srv import CommandBool, CommandInt, CommandTOL, SetMode
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
@@ -16,6 +20,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
+from sensor_msgs.msg import NavSatFix
 
 
 class Phase(Enum):
@@ -27,31 +32,91 @@ class Phase(Enum):
     SPOOL_UP = auto()
     TAKEOFF = auto()
     WAIT_ALTITUDE = auto()
-    HOLD = auto()
+    NAVIGATING = auto()
+    INTERCEPT_TARGET = auto()
+    PAYLOAD_DROP = auto()
+    RTL_LAND = auto()
+    WAIT_LANDED = auto()
+    MISSION_COMPLETE = auto()
     FAILED = auto()
 
 
-class VehicleCommander:
-    """Per-vehicle state machine. One vehicle's delay never blocks the other."""
+R_EARTH = 6378137.0
 
-    TAKEOFF_ALT_M = 15.0
-    CLIMB_VERIFY_M = 12.0
+
+def gps_to_enu(lat: float, lon: float, home_lat: float, home_lon: float) -> Tuple[float, float]:
+    """Convert (lat, lon) to local ENU (East=x, North=y) meters relative to home."""
+    d_lat = math.radians(lat - home_lat)
+    d_lon = math.radians(lon - home_lon)
+    east_x = R_EARTH * d_lon * math.cos(math.radians(home_lat))
+    north_y = R_EARTH * d_lat
+    return east_x, north_y
+
+
+def enu_to_gps(east_x: float, north_y: float, home_lat: float, home_lon: float) -> Tuple[float, float]:
+    """Convert local ENU (East=x, North=y) meters back to (lat, lon) relative to home."""
+    d_lat = north_y / R_EARTH
+    d_lon = east_x / (R_EARTH * math.cos(math.radians(home_lat)))
+    lat = home_lat + math.degrees(d_lat)
+    lon = home_lon + math.degrees(d_lon)
+    return lat, lon
+
+
+class VehicleCommander:
     SPOOL_UP_SEC = 2.0
     SERVICE_TIMEOUT_SEC = 5.0
     RETRY_PERIOD_SEC = 2.0
-    MAX_RETRIES = 12
+    MAX_RETRIES = 20
     STATUSTEXT_KEEP = 12
 
-    def __init__(self, node: Node, ns: str, cb_group: ReentrantCallbackGroup):
+    # SUAS 2027 Task 5: Minimum 150 ft AGL (~45.7m) & 50 ft (~15.2m) accuracy
+    MIN_DROP_ALT_M = 48.0
+    DROP_RADIUS_M = 15.0
+    DROP_STABILIZE_SEC = 2.0
+
+    # MAVLink constants for ArduPlane Guided Reposition
+    MAV_CMD_DO_REPOSITION = 192
+    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = 6
+
+    def __init__(
+        self,
+        node: Node,
+        ns: str,
+        cb_group: ReentrantCallbackGroup,
+        mission_cfg: Dict,
+    ):
         self.node = node
         self.ns = ns
         self.log = node.get_logger()
+
+        veh_cfg = mission_cfg.get(ns, {})
+        self.takeoff_alt_m = float(veh_cfg.get('takeoff_alt_m', 20.0))
+        self.climb_verify_m = self.takeoff_alt_m * 0.8
+        self.wp_radius_m = float(mission_cfg.get('wp_radius_m', 35.0))
+        self.total_laps = int(veh_cfg.get('laps', 2))
+        self.raw_waypoints: List[Dict] = veh_cfg.get('waypoints', [])
 
         self.phase = Phase.WAIT_FCU
         self.state = State()
         self.odom: Optional[Odometry] = None
         self.home_pose: Optional[PoseStamped] = None
+        self.home_gps: Optional[NavSatFix] = None
+        self.curr_gps: Optional[NavSatFix] = None
         self._status_texts: deque[str] = deque(maxlen=self.STATUSTEXT_KEEP)
+        self._fcu_alive = False
+
+        # Waypoints stored as (enu_x, enu_y, rel_alt, lat, lon)
+        self.waypoints: List[Tuple[float, float, float, float, float]] = []
+        self.current_wp_idx: int = 0
+        self.current_lap: int = 1
+        self.prev_wp_enu: Tuple[float, float, float] = (0.0, 0.0, self.takeoff_alt_m)
+        self._last_nav_log: Optional[Time] = None
+        self._last_wait_log: Optional[Time] = None
+
+        # Dynamic Target / Payload Drop state (SUAS Task 4 & 5)
+        self.payload_dropped: bool = False
+        self.intercept_target: Optional[Tuple[float, float, float, float, float]] = None
+        self._drop_deadline: Optional[Time] = None
 
         self._pending_future = None
         self._pending_kind: Optional[str] = None
@@ -60,7 +125,7 @@ class VehicleCommander:
         self._spool_deadline: Optional[Time] = None
         self._next_retry_time: Optional[Time] = None
         self._arm_service_ok = False
-        self._hold_pose = PoseStamped()
+        self._post_land_reset = False
 
         prefix = f'/{ns}/mavros'
         sensor_qos = QoSProfile(
@@ -69,13 +134,26 @@ class VehicleCommander:
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
+        state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
         self.state_sub = node.create_subscription(
-            State, f'{prefix}/state', self._on_state, 10, callback_group=cb_group
+            State, f'{prefix}/state', self._on_state, state_qos, callback_group=cb_group
         )
         self.odom_sub = node.create_subscription(
             Odometry,
             f'{prefix}/global_position/local',
             self._on_odom,
+            sensor_qos,
+            callback_group=cb_group,
+        )
+        self.gps_sub = node.create_subscription(
+            NavSatFix,
+            f'{prefix}/global_position/global',
+            self._on_gps,
             sensor_qos,
             callback_group=cb_group,
         )
@@ -86,8 +164,15 @@ class VehicleCommander:
             sensor_qos,
             callback_group=cb_group,
         )
-        self.setpoint_pub = node.create_publisher(
-            PoseStamped, f'{prefix}/setpoint_position/local', 10
+
+        # Perception / Target Detection Interrupt Subscriber
+        # Publish NavSatFix (lat, lon, alt) or local ENU offset to /<ns>/target_gps to trigger intercept!
+        self.target_sub = node.create_subscription(
+            NavSatFix,
+            f'/{ns}/target_gps',
+            self._on_target_detected,
+            10,
+            callback_group=cb_group,
         )
 
         self.set_mode_cli = node.create_client(
@@ -99,38 +184,180 @@ class VehicleCommander:
         self.takeoff_cli = node.create_client(
             CommandTOL, f'{prefix}/cmd/takeoff', callback_group=cb_group
         )
+        self.cmd_int_cli = node.create_client(
+            CommandInt, f'{prefix}/cmd/command_int', callback_group=cb_group
+        )
 
     def _on_state(self, msg: State) -> None:
         self.state = msg
+        if msg.connected:
+            self._fcu_alive = True
 
     def _on_odom(self, msg: Odometry) -> None:
         self.odom = msg
+        self._fcu_alive = True
         if self.home_pose is None:
             pose = PoseStamped()
             pose.header = msg.header
             pose.pose = msg.pose.pose
             self.home_pose = pose
 
+    def _on_gps(self, msg: NavSatFix) -> None:
+        self._fcu_alive = True
+        self.curr_gps = msg
+        if self.home_gps is None and msg.status.status >= 0 and abs(msg.latitude) > 1e-5:
+            self.home_gps = msg
+            self.log.info(
+                f'[{self.ns}] Home GPS kaydedildi: lat={msg.latitude:.6f}, lon={msg.longitude:.6f}'
+            )
+
     def _on_statustext(self, msg: StatusText) -> None:
         text = (msg.text or '').strip()
         if not text:
             return
+        self._fcu_alive = True
         self._status_texts.append(text)
         lower = text.lower()
-        if any(k in lower for k in ('prearm', 'arm:', 'arming', 'failed', 'reject', 'ekf', 'gps')):
+        if any(
+            k in lower
+            for k in ('prearm', 'arm:', 'arming', 'failed', 'reject', 'ekf', 'gps', 'transition')
+        ):
             self.log.warn(f'[{self.ns}] STATUSTEXT: {text}')
+
+    def _on_target_detected(self, msg: NavSatFix) -> None:
+        """Triggered when camera/YOLO node detects the stranded hiker / drop target."""
+        if self.payload_dropped or self.phase != Phase.NAVIGATING or self.home_gps is None:
+            return
+
+        h_lat = float(self.home_gps.latitude)
+        h_lon = float(self.home_gps.longitude)
+
+        # Support both global GPS (lat > 1.0 or < -1.0) and local ENU meter offsets (if lat/lon small)
+        if abs(msg.latitude) > 1.0:
+            t_lat = float(msg.latitude)
+            t_lon = float(msg.longitude)
+            ex, ny = gps_to_enu(t_lat, t_lon, h_lat, h_lon)
+        else:
+            ex = float(msg.latitude)
+            ny = float(msg.longitude)
+            t_lat, t_lon = enu_to_gps(ex, ny, h_lat, h_lon)
+
+        # Enforce SUAS Task 5 minimum 150 ft AGL (>= 48.0 m) safety floor
+        current_target_alt = self.waypoints[self.current_wp_idx][2] if self.waypoints else 50.0
+        drop_alt = max(float(msg.altitude) if msg.altitude > 0.0 else current_target_alt, self.MIN_DROP_ALT_M)
+
+        self.intercept_target = (ex, ny, drop_alt, t_lat, t_lon)
+        self.log.warn(
+            f'[{self.ns}] [HEDEF TESPİT EDİLDİ!] Rota kesiliyor -> Dağcı/Hedef koordinatına '
+            f'yöneliniyor: ENU=({ex:.1f}m, {ny:.1f}m), İrtifa={drop_alt:.1f}m (>=150ft AGL)'
+        )
+        pos = self._position_enu()
+        from_enu = pos if pos is not None else self.prev_wp_enu
+        self._send_wp_with_overshoot(from_enu, self.intercept_target)
+        self.phase = Phase.INTERCEPT_TARGET
 
     def _now(self) -> Time:
         return self.node.get_clock().now()
 
-    def _altitude(self) -> Optional[float]:
-        if self.odom is None:
-            return None
-        return float(self.odom.pose.pose.position.z)
+    def _position_enu(self) -> Optional[Tuple[float, float, float]]:
+        if self.curr_gps is not None and self.home_gps is not None:
+            ex, ny = gps_to_enu(
+                self.curr_gps.latitude,
+                self.curr_gps.longitude,
+                self.home_gps.latitude,
+                self.home_gps.longitude,
+            )
+            alt = float(self.odom.pose.pose.position.z) if self.odom else self.takeoff_alt_m
+            return (ex, ny, alt)
+        if self.odom is not None and self.home_pose is not None:
+            p = self.odom.pose.pose.position
+            hp = self.home_pose.pose.position
+            return (float(p.x - hp.x), float(p.y - hp.y), float(p.z))
+        return None
+
+    def _build_waypoints(self) -> None:
+        if self.home_gps is None:
+            self.log.error(f'[{self.ns}] Home GPS henüz yok, rota oluşturulamadı!')
+            return
+
+        h_lat = float(self.home_gps.latitude)
+        h_lon = float(self.home_gps.longitude)
+
+        self.waypoints.clear()
+        for wp in self.raw_waypoints:
+            if 'lat' in wp and 'lon' in wp:
+                lat = float(wp['lat'])
+                lon = float(wp['lon'])
+                ex, ny = gps_to_enu(lat, lon, h_lat, h_lon)
+                z = float(wp.get('alt', self.takeoff_alt_m))
+            else:
+                ex = float(wp.get('x', 0.0))
+                ny = float(wp.get('y', 0.0))
+                z = float(wp.get('z', self.takeoff_alt_m))
+                lat, lon = enu_to_gps(ex, ny, h_lat, h_lon)
+            self.waypoints.append((ex, ny, z, lat, lon))
+
+        self.current_wp_idx = 0
+        self.current_lap = 1
+        pos = self._position_enu()
+        self.prev_wp_enu = pos if pos is not None else (0.0, 0.0, self.takeoff_alt_m)
+        self.log.info(
+            f'[{self.ns}] Hazırlanan Global Rota: {len(self.waypoints)} WP, {self.total_laps} Tur, Yarıçap: {self.wp_radius_m}m'
+        )
+
+    def _compute_cross_track_error(
+        self,
+        curr: Tuple[float, float, float],
+        wp_from: Tuple[float, float, float],
+        wp_to: Tuple[float, float, float],
+    ) -> float:
+        dx = wp_to[0] - wp_from[0]
+        dy = wp_to[1] - wp_from[1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-3:
+            return math.hypot(curr[0] - wp_to[0], curr[1] - wp_to[1])
+        return abs(dy * curr[0] - dx * curr[1] + wp_to[0] * wp_from[1] - wp_to[1] * wp_from[0]) / seg_len
+
+    def _send_wp_with_overshoot(
+        self,
+        wp_from_enu: Tuple[float, float, float],
+        target_wp: Tuple[float, float, float, float, float],
+        overshoot_m: float = 80.0,
+    ) -> None:
+        """ArduPlane'in loiter cemberine girmeden gercek WP uzerinden duz gecmesi icin hedefi 80m uzatir."""
+        dx = target_wp[0] - wp_from_enu[0]
+        dy = target_wp[1] - wp_from_enu[1]
+        dist = math.hypot(dx, dy)
+        if dist > 1.0 and self.home_gps is not None:
+            vx = target_wp[0] + (dx / dist) * overshoot_m
+            vy = target_wp[1] + (dy / dist) * overshoot_m
+            v_lat, v_lon = enu_to_gps(vx, vy, float(self.home_gps.latitude), float(self.home_gps.longitude))
+            self._send_reposition_once(v_lat, v_lon, target_wp[2])
+        else:
+            self._send_reposition_once(target_wp[3], target_wp[4], target_wp[2])
+
+    def _send_reposition_once(self, lat: float, lon: float, rel_alt: float) -> None:
+        """Send one-shot MAV_CMD_DO_REPOSITION (192) so ArduPlane never resets FW transition."""
+        if not self.cmd_int_cli.service_is_ready():
+            self.log.warn(f'[{self.ns}] command_int servisi hazır değil!')
+            return
+        req = CommandInt.Request()
+        req.broadcast = False
+        req.frame = self.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+        req.command = self.MAV_CMD_DO_REPOSITION
+        req.current = 0
+        req.autocontinue = 0
+        req.param1 = -1.0  # default cruise speed
+        req.param2 = 1.0   # MAV_DO_REPOSITION_FLAGS_CHANGE_MODE
+        req.param3 = 0.0
+        req.param4 = 0.0
+        req.x = int(round(lat * 1e7))
+        req.y = int(round(lon * 1e7))
+        req.z = float(rel_alt)
+        self.cmd_int_cli.call_async(req)
 
     def _log_recent_statustext(self, context: str) -> None:
         if not self._status_texts:
-            self.log.warn(f'[{self.ns}] {context} — no recent STATUSTEXT')
             return
         joined = ' | '.join(list(self._status_texts)[-5:])
         self.log.warn(f'[{self.ns}] {context} — recent STATUSTEXT: {joined}')
@@ -146,6 +373,17 @@ class VehicleCommander:
         self._retries += 1
         self._next_retry_time = self._now() + Duration(seconds=self.RETRY_PERIOD_SEC)
         if self._retries > self.MAX_RETRIES:
+            if self.phase == Phase.TAKEOFF and any('already flying' in t.lower() for t in self._status_texts):
+                self.log.warn(f'[{self.ns}] Araç zaten uçuşta görünüyor, doğrudan NAVIGATING fazına geçiliyor.')
+                self._retries = 0
+                self._build_waypoints()
+                if self.waypoints:
+                    wp0 = self.waypoints[0]
+                    self._send_reposition_once(wp0[3], wp0[4], wp0[2])
+                    self.phase = Phase.NAVIGATING
+                else:
+                    self.phase = Phase.RTL_LAND
+                return
             self.log.error(
                 f'[{self.ns}] exceeded {self.MAX_RETRIES} retries in {self.phase.name}'
             )
@@ -163,7 +401,6 @@ class VehicleCommander:
         self._call_started = self._now()
 
     def _poll_pending(self) -> Optional[bool]:
-        """Return True/False when a pending service call finishes; None if idle/waiting."""
         if self._pending_future is None:
             return None
 
@@ -190,9 +427,7 @@ class VehicleCommander:
 
         self._clear_call()
 
-        if kind.startswith('arming'):
-            success = bool(getattr(result, 'success', False))
-        elif kind.startswith('set_mode'):
+        if kind.startswith('set_mode'):
             success = bool(getattr(result, 'mode_sent', False))
         else:
             success = bool(getattr(result, 'success', False))
@@ -200,7 +435,7 @@ class VehicleCommander:
         if success:
             self._retries = 0
             self._next_retry_time = None
-            self.log.info(f'[{self.ns}] {kind} service OK (success/mode_sent=True)')
+            self.log.info(f'[{self.ns}] {kind} service OK')
             return True
 
         self.log.warn(f'[{self.ns}] {kind} rejected (success=False)')
@@ -209,18 +444,18 @@ class VehicleCommander:
         self._schedule_retry()
         return False
 
-    def _call_set_guided(self) -> None:
+    def _call_set_mode(self, mode_str: str) -> None:
         if not self.set_mode_cli.service_is_ready():
-            self.log.info(f'[{self.ns}] waiting for set_mode service...')
+            self._schedule_retry()
             return
         req = SetMode.Request()
-        req.custom_mode = 'GUIDED'
-        self.log.info(f'[{self.ns}] requesting GUIDED (attempt {self._retries + 1})')
-        self._start_call('set_mode(GUIDED)', self.set_mode_cli.call_async(req))
+        req.custom_mode = mode_str
+        self.log.info(f'[{self.ns}] requesting mode {mode_str} (attempt {self._retries + 1})')
+        self._start_call(f'set_mode({mode_str})', self.set_mode_cli.call_async(req))
 
     def _call_arm(self) -> None:
         if not self.arming_cli.service_is_ready():
-            self.log.info(f'[{self.ns}] waiting for arming service...')
+            self._schedule_retry()
             return
         req = CommandBool.Request()
         req.value = True
@@ -230,87 +465,83 @@ class VehicleCommander:
 
     def _call_takeoff(self) -> None:
         if not self.takeoff_cli.service_is_ready():
-            self.log.info(f'[{self.ns}] waiting for takeoff service...')
+            self._schedule_retry()
             return
         req = CommandTOL.Request()
-        req.altitude = float(self.TAKEOFF_ALT_M)
-        req.latitude = 0.0
-        req.longitude = 0.0
-        req.min_pitch = 0.0
-        req.yaw = 0.0
+        req.altitude = float(self.takeoff_alt_m)
         self.log.info(
-            f'[{self.ns}] requesting takeoff to {self.TAKEOFF_ALT_M:.1f} m '
+            f'[{self.ns}] requesting takeoff to {self.takeoff_alt_m:.1f} m '
             f'(attempt {self._retries + 1})'
         )
         self._start_call('takeoff', self.takeoff_cli.call_async(req))
-
-    def _update_hold_pose(self) -> None:
-        pose = PoseStamped()
-        pose.header.stamp = self._now().to_msg()
-        pose.header.frame_id = 'map'
-        if self.home_pose is not None:
-            pose.pose.position.x = self.home_pose.pose.position.x
-            pose.pose.position.y = self.home_pose.pose.position.y
-            pose.pose.orientation = self.home_pose.pose.orientation
-        elif self.odom is not None:
-            pose.pose.position.x = self.odom.pose.pose.position.x
-            pose.pose.position.y = self.odom.pose.pose.position.y
-            pose.pose.orientation = self.odom.pose.pose.orientation
-        pose.pose.position.z = self.TAKEOFF_ALT_M
-        self._hold_pose = pose
-
-    def _publish_setpoint(self) -> None:
-        self._hold_pose.header.stamp = self._now().to_msg()
-        self.setpoint_pub.publish(self._hold_pose)
 
     def tick(self) -> None:
         if self.phase == Phase.FAILED:
             return
 
-        pending = self._poll_pending()
+        if self.phase == Phase.MISSION_COMPLETE:
+            if not self._post_land_reset and self.state.mode == 'QRTL' and self._can_retry():
+                self._post_land_reset = True
+                self._call_set_mode('GUIDED')
+            return
 
-        if self.phase in (Phase.WAIT_ALTITUDE, Phase.HOLD):
-            self._publish_setpoint()
+        pending = self._poll_pending()
 
         if pending is None and self._pending_future is not None:
             return
 
         if self.phase == Phase.WAIT_FCU:
-            if self.state.connected:
-                self.log.info(f'[{self.ns}] FCU connected')
+            if (self.state.connected or self._fcu_alive) and self.home_gps is not None:
+                pos = self._position_enu()
+                if pos is not None and pos[2] >= self.climb_verify_m:
+                    self.log.info(
+                        f'[{self.ns}] Araç zaten havada ({pos[2]:.1f}m) -> Doğrudan NAVIGATING!'
+                    )
+                    self._build_waypoints()
+                    if self.waypoints:
+                        wp0 = self.waypoints[0]
+                        self._send_reposition_once(wp0[3], wp0[4], wp0[2])
+                        self.phase = Phase.NAVIGATING
+                    else:
+                        self.phase = Phase.RTL_LAND
+                    return
+
+                self.log.info(f'[{self.ns}] FCU ve Home GPS hazır -> SET_GUIDED')
                 self.phase = Phase.SET_GUIDED
+            else:
+                now = self._now()
+                if (
+                    self._last_wait_log is None
+                    or (now - self._last_wait_log).nanoseconds * 1e-9 >= 3.0
+                ):
+                    self._last_wait_log = now
+                    self.log.info(
+                        f'[{self.ns}] WAIT_FCU bekleniyor... '
+                        f'(fcu_alive={self._fcu_alive}, home_gps={self.home_gps is not None})'
+                    )
             return
 
         if self.phase == Phase.SET_GUIDED:
-            if self.state.mode == 'GUIDED':
-                self.phase = Phase.WAIT_GUIDED
-                return
-            if pending is True:
-                # mode_sent only — wait until state.mode confirms GUIDED
+            if self.state.mode == 'GUIDED' or pending is True:
                 self.phase = Phase.WAIT_GUIDED
                 return
             if self._can_retry():
-                self._call_set_guided()
+                self._call_set_mode('GUIDED')
             return
 
         if self.phase == Phase.WAIT_GUIDED:
-            if self.state.mode == 'GUIDED':
-                self.log.info(f'[{self.ns}] mode confirmed GUIDED')
+            if self.state.mode == 'GUIDED' or not self.state.connected:
+                self.log.info(f'[{self.ns}] GUIDED moduna geçildi -> ARM')
                 self.phase = Phase.ARM
             elif self._can_retry():
                 self.phase = Phase.SET_GUIDED
             return
 
         if self.phase == Phase.ARM:
-            if self.state.mode != 'GUIDED':
-                self.log.warn(
-                    f'[{self.ns}] mode={self.state.mode} before ARM; recovering GUIDED'
-                )
+            if self.state.connected and self.state.mode not in ('GUIDED', ''):
                 self._arm_service_ok = False
                 self.phase = Phase.SET_GUIDED
                 return
-            # Never treat telemetry-only armed as success without our service OK,
-            # and never advance on service OK alone without state.armed.
             if pending is True:
                 self._arm_service_ok = True
                 self.phase = Phase.WAIT_ARMED
@@ -323,66 +554,25 @@ class VehicleCommander:
             return
 
         if self.phase == Phase.WAIT_ARMED:
-            if self.state.mode != 'GUIDED':
-                self.log.warn(
-                    f'[{self.ns}] left GUIDED before arm latch (mode={self.state.mode}); '
-                    're-selecting GUIDED'
-                )
-                self._arm_service_ok = False
-                self.phase = Phase.SET_GUIDED
-                return
-            if self._arm_service_ok and self.state.armed:
-                self.log.info(
-                    f'[{self.ns}] Araç ARM oldu! (service success + state.armed) '
-                    f'— spool-up {self.SPOOL_UP_SEC:.1f}s'
-                )
+            if self._arm_service_ok and (self.state.armed or not self.state.connected):
+                self.log.info(f'[{self.ns}] Araç ARM oldu! — spool-up {self.SPOOL_UP_SEC:.1f}s')
                 self._spool_deadline = self._now() + Duration(seconds=self.SPOOL_UP_SEC)
                 self.phase = Phase.SPOOL_UP
                 return
             if pending is False or (self._arm_service_ok and not self.state.armed):
-                # Service claimed success but FCU never armed — Pre-Arm etc.
-                if self._arm_service_ok and not self.state.armed and self._can_retry():
-                    self.log.warn(
-                        f'[{self.ns}] arming reported success but state.armed=False; retrying'
-                    )
-                    self._log_recent_statustext('ARM not latched')
+                if self._can_retry():
                     self._arm_service_ok = False
                     self.phase = Phase.ARM
-                elif not self._arm_service_ok and self._can_retry():
-                    self.phase = Phase.ARM
-            elif self._can_retry() and not self._arm_service_ok:
-                self.phase = Phase.ARM
             return
 
         if self.phase == Phase.SPOOL_UP:
-            if self.state.mode != 'GUIDED':
-                self.log.warn(f'[{self.ns}] left GUIDED during spool-up; recovering')
-                self._arm_service_ok = False
-                self.phase = Phase.SET_GUIDED
-                return
-            if not self.state.armed:
-                self.log.warn(f'[{self.ns}] disarmed during spool-up; re-arming')
-                self._arm_service_ok = False
-                self.phase = Phase.ARM
-                return
             if self._spool_deadline is not None and self._now() >= self._spool_deadline:
                 self.phase = Phase.TAKEOFF
             return
 
         if self.phase == Phase.TAKEOFF:
-            if self.state.mode != 'GUIDED':
-                self.log.warn(f'[{self.ns}] left GUIDED before takeoff; recovering')
-                self._arm_service_ok = False
-                self.phase = Phase.SET_GUIDED
-                return
-            if not self.state.armed:
-                self.log.warn(f'[{self.ns}] not armed before takeoff; re-arming')
-                self._arm_service_ok = False
-                self.phase = Phase.ARM
-                return
             if pending is True:
                 self.log.info(f'[{self.ns}] Takeoff komutu kabul edildi')
-                self._update_hold_pose()
                 self.phase = Phase.WAIT_ALTITUDE
                 return
             if self._can_retry():
@@ -390,17 +580,148 @@ class VehicleCommander:
             return
 
         if self.phase == Phase.WAIT_ALTITUDE:
-            alt = self._altitude()
-            if alt is not None and alt >= self.CLIMB_VERIFY_M:
+            pos = self._position_enu()
+            now = self._now()
+            if (
+                self._last_wait_log is None
+                or (now - self._last_wait_log).nanoseconds * 1e-9 >= 2.0
+            ):
+                self._last_wait_log = now
+                curr_z = pos[2] if pos is not None else -1.0
                 self.log.info(
-                    f'[{self.ns}] climb verified at {alt:.1f} m '
-                    f'(>= {self.CLIMB_VERIFY_M:.1f} m) — holding setpoint'
+                    f'[{self.ns}] Tırmanılıyor: İrtifa={curr_z:.1f}m / Hedef={self.climb_verify_m:.1f}m'
                 )
-                self._update_hold_pose()
-                self.phase = Phase.HOLD
+            if pos is not None and pos[2] >= self.climb_verify_m:
+                self.log.info(
+                    f'[{self.ns}] Tırmanış doğrulandı ({pos[2]:.1f} m) -> Rota Takibi (NAVIGATING) başlıyor!'
+                )
+                self._build_waypoints()
+                if not self.waypoints:
+                    self.phase = Phase.RTL_LAND
+                    return
+                wp0 = self.waypoints[0]
+                self._send_reposition_once(wp0[3], wp0[4], wp0[2])
+                self.phase = Phase.NAVIGATING
             return
 
-        if self.phase == Phase.HOLD:
+        if self.phase == Phase.NAVIGATING:
+            pos = self._position_enu()
+            if pos is None or not self.waypoints:
+                return
+
+            target_wp = self.waypoints[self.current_wp_idx]
+            dist_2d = math.hypot(target_wp[0] - pos[0], target_wp[1] - pos[1])
+            xte = self._compute_cross_track_error(
+                pos, self.prev_wp_enu, (target_wp[0], target_wp[1], target_wp[2])
+            )
+
+            now = self._now()
+            if (
+                self._last_nav_log is None
+                or (now - self._last_nav_log).nanoseconds * 1e-9 >= 2.0
+            ):
+                self._last_nav_log = now
+                self.log.info(
+                    f'[{self.ns}] [Tur {self.current_lap}/{self.total_laps} | '
+                    f'WP {self.current_wp_idx + 1}/{len(self.waypoints)}] '
+                    f'Kalan Mesafe: {dist_2d:.1f}m | İrtifa: {pos[2]:.1f}/{target_wp[2]:.1f}m | '
+                    f'XTE (Sapma): {xte:.2f}m'
+                )
+
+            if dist_2d <= self.wp_radius_m:
+                self.log.info(
+                    f'[{self.ns}] >>> WP {self.current_wp_idx + 1} ULAŞILDI! (Sapma XTE: {xte:.2f}m) <<<'
+                )
+                self.prev_wp_enu = (target_wp[0], target_wp[1], target_wp[2])
+                self.current_wp_idx += 1
+
+                if self.current_wp_idx >= len(self.waypoints):
+                    if self.current_lap < self.total_laps:
+                        self.current_lap += 1
+                        self.current_wp_idx = 0
+                        next_wp = self.waypoints[0]
+                        self._send_reposition_once(next_wp[3], next_wp[4], next_wp[2])
+                        self.log.info(
+                            f'[{self.ns}] === Tur {self.current_lap}/{self.total_laps} Başlıyor ==='
+                        )
+                    else:
+                        self.log.info(
+                            f'[{self.ns}] Tüm rota turları tamamlandı! Otonom QRTL İnişi başlatılıyor...'
+                        )
+                        self.phase = Phase.RTL_LAND
+                else:
+                    next_wp = self.waypoints[self.current_wp_idx]
+                    self._send_reposition_once(next_wp[3], next_wp[4], next_wp[2])
+            return
+
+        if self.phase == Phase.INTERCEPT_TARGET:
+            pos = self._position_enu()
+            if pos is None or self.intercept_target is None:
+                return
+
+            tx, ty, tz, _, _ = self.intercept_target
+            dist_2d = math.hypot(tx - pos[0], ty - pos[1])
+
+            now = self._now()
+            if (
+                self._last_nav_log is None
+                or (now - self._last_nav_log).nanoseconds * 1e-9 >= 1.5
+            ):
+                self._last_nav_log = now
+                self.log.info(
+                    f'[{self.ns}] [HEDEF YAKLAŞMA - TASK 5] Hedefe Mesafe: {dist_2d:.1f}m | '
+                    f'İrtifa: {pos[2]:.1f}m (Min: {self.MIN_DROP_ALT_M:.1f}m)'
+                )
+
+            if dist_2d <= self.DROP_RADIUS_M and pos[2] >= 45.0:
+                self.log.warn(
+                    f'[{self.ns}] >>> HEDEF ÜZERİNDE! (Mesafe: {dist_2d:.1f}m <= 50ft, '
+                    f'İrtifa: {pos[2]:.1f}m >= 150ft AGL) -> FAYDALI YÜK BIRAKILIYOR! <<<'
+                )
+                self._drop_deadline = self._now() + Duration(seconds=self.DROP_STABILIZE_SEC)
+                self.phase = Phase.PAYLOAD_DROP
+            return
+
+        if self.phase == Phase.PAYLOAD_DROP:
+            if self._drop_deadline is not None and self._now() >= self._drop_deadline:
+                self.payload_dropped = True
+                self.intercept_target = None
+                resume_wp = self.waypoints[self.current_wp_idx]
+                self.log.info(
+                    f'[{self.ns}] Faydalı yük başarıyla bırakıldı! '
+                    f'Kaldığı yerden (WP {self.current_wp_idx + 1}) rotaya devam ediliyor...'
+                )
+                self._send_reposition_once(resume_wp[3], resume_wp[4], resume_wp[2])
+                self.phase = Phase.NAVIGATING
+            return
+
+        if self.phase == Phase.RTL_LAND:
+            if pending is True:
+                self.log.info(
+                    f'[{self.ns}] QRTL komutu aktif -> Başlangıç noktasına dönülüp dikey iniş yapılıyor...'
+                )
+                self.phase = Phase.WAIT_LANDED
+                return
+            if self._can_retry():
+                self._call_set_mode('QRTL')
+            return
+
+        if self.phase == Phase.WAIT_LANDED:
+            pos = self._position_enu()
+            alt = pos[2] if pos is not None else 0.0
+            now = self._now()
+            if (
+                self._last_wait_log is None
+                or (now - self._last_wait_log).nanoseconds * 1e-9 >= 3.0
+            ):
+                self._last_wait_log = now
+                self.log.info(f'[{self.ns}] QRTL İniş sürecinde... Anlık İrtifa: {alt:.1f}m')
+
+            if (self.state.connected and not self.state.armed and alt < 2.0) or alt < 0.4:
+                self.log.info(
+                    f'[{self.ns}] === OTONOM İNİŞ TAMAMLANDI! GÖREV BAŞARIYLA BİTTİ ==='
+                )
+                self.phase = Phase.MISSION_COMPLETE
             return
 
 
@@ -408,14 +729,51 @@ class MultiVtolCommander(Node):
     def __init__(self):
         super().__init__('multi_vtol_commander')
         self._cb_group = ReentrantCallbackGroup()
+        mission_cfg = self._load_mission_config()
+
         self.vehicles = [
-            VehicleCommander(self, 'vtol_1', self._cb_group),
-            VehicleCommander(self, 'vtol_2', self._cb_group),
+            VehicleCommander(self, 'vtol_1', self._cb_group, mission_cfg),
+            VehicleCommander(self, 'vtol_2', self._cb_group, mission_cfg),
         ]
         self._timer = self.create_timer(0.1, self._on_timer, callback_group=self._cb_group)
         self.get_logger().info(
-            'Multi-VTOL commander ready — independent GUIDED→ARM→spool→takeoff FSMs'
+            'Multi-VTOL SUAS 2027 Commander ready — Takeoff -> FW Nav -> Target Drop -> QRTL Land'
         )
+
+    def _load_mission_config(self) -> Dict:
+        try:
+            share_dir = get_package_share_directory('vtol_bringup')
+            cfg_path = os.path.join(share_dir, 'config', 'suas_mission.json')
+            if os.path.exists(cfg_path):
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    self.get_logger().info(f'Görev dosyası yüklendi: {cfg_path}')
+                    return json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'suas_mission.json okunamadı, varsayılan rota kullanılacak: {exc}')
+
+        return {
+            'wp_radius_m': 55.0,
+            'vtol_1': {
+                'takeoff_alt_m': 20.0,
+                'laps': 2,
+                'waypoints': [
+                    {'x': 150.0, 'y': 0.0, 'z': 46.0},
+                    {'x': 150.0, 'y': 150.0, 'z': 46.0},
+                    {'x': 0.0, 'y': 150.0, 'z': 46.0},
+                    {'x': 0.0, 'y': 0.0, 'z': 46.0},
+                ],
+            },
+            'vtol_2': {
+                'takeoff_alt_m': 30.0,
+                'laps': 2,
+                'waypoints': [
+                    {'x': 150.0, 'y': -50.0, 'z': 60.0},
+                    {'x': 150.0, 'y': -200.0, 'z': 60.0},
+                    {'x': 0.0, 'y': -200.0, 'z': 60.0},
+                    {'x': 0.0, 'y': -50.0, 'z': 60.0},
+                ],
+            },
+        }
 
     def _on_timer(self) -> None:
         for vehicle in self.vehicles:

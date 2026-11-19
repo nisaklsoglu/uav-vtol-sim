@@ -1,9 +1,25 @@
-# Çoklu Ajanlı VTOL Simülasyon Altyapısı
-### Gazebo Harmonic · ArduPilot SITL · ROS 2 Humble · MAVROS
+# Çoklu Ajanlı VTOL Simülasyon ve Otonom Görev Altyapısı
 
-Bu depo, **Gazebo Harmonic (GZ Sim 8)** üzerinde iki bağımsız VTOL (QuadPlane) modelinin fizik simülasyonunu, ArduPilot SITL otopilot süreçlerini ve ROS 2 Humble üzerindeki bağımsız MAVROS telemetri ve kontrol köprülerini tek bir komutla başlatan simülasyon altyapısını içerir.
+![Gazebo](https://img.shields.io/badge/Gazebo-Harmonic%20(GZ%20Sim%208)-orange)
+![ArduPilot](https://img.shields.io/badge/ArduPilot-SITL-blue)
+![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E)
+![MAVROS](https://img.shields.io/badge/MAVROS-ROS%202-green)
 
-Sistem, iki İHA'nın birbirinden bağımsız şekilde çalışmasını sağlayarak çoklu ajan kontrol algoritmalarının, otonom görev planlayıcılarının ve sürü yazılımlarının geliştirilmesi ve test edilmesi için bir ortam sunar.
+Bu depo, **Gazebo Harmonic (GZ Sim 8)** üzerinde iki bağımsız VTOL (QuadPlane) modelinin fizik simülasyonunu, ArduPilot SITL otopilot süreçlerini, ROS 2 Humble üzerindeki bağımsız MAVROS telemetri/kontrol köprülerini ve **SUAS 2027 & TEKNOFEST** isterlerine göre geliştirilmiş otonom görev yöneticisini (`multi_vtol_commander`) içerir.
+
+Sistem, iki İHA'nın birbirinden bağımsız durum makineleri (state machine) olarak uçmasını sağlayarak otonom rota takibi, dinamik hedef kesmesi (target interrupt), faydalı yük bırakma (payload drop) ve otonom `QRTL` iniş senaryolarının geliştirilmesi ve test edilmesi için uçtan uca bir ortam sunar.
+
+## İçindekiler
+
+1. [Mimari ve Ağ Yapısı](#1-mimari-ve-ağ-yapısı)
+2. [Otonom Görev Mimarisi ve Tasarım Kararları](#2-otonom-görev-mimarisi-multi_vtol_commander-ve-tasarım-kararları)
+3. [Ön Koşullar ve Bağımlılıklar](#3-ön-koşullar-ve-bağımlılıklar)
+4. [Kurulum, Derleme ve Çalıştırma](#4-kurulum-derleme-ve-çalıştırma)
+5. [Hedef Kesmesi ve Faydalı Yük Bırakma Testi](#5-hedef-kesmesi-ve-faydalı-yük-bırakma-testi-task-4--task-5)
+6. [ROS 2 Topic ve Servis Arayüzleri](#6-ros-2-topic-ve-servis-arayüzleri)
+7. [Simülasyonu Durdurma ve Süreç Temizliği](#7-simülasyonu-durdurma-ve-süreç-temizliği)
+8. [Sorun Giderme](#8-sorun-giderme)
+9. [Ek Dokümantasyon](#9-kamera-entegrasyonu-ve-ek-dokümantasyon)
 
 ---
 
@@ -11,7 +27,7 @@ Sistem, iki İHA'nın birbirinden bağımsız şekilde çalışmasını sağlaya
 
 Her iki İHA da bağımsız ArduPilot SITL instance'ları olarak çalıştırılır. MAVROS köprüleri, TCP bağlantıları üzerinden ilgili otopilotlarla iletişim kurarak telemetri ve kontrol arayüzlerini ROS 2 ekosistemine aktarır.
 
-### İHA yapılandırması
+### İHA Yapılandırması
 
 | Parametre | VTOL 1 | VTOL 2 |
 |---|---|---|
@@ -21,295 +37,205 @@ Her iki İHA da bağımsız ArduPilot SITL instance'ları olarak çalıştırıl
 | MAVROS bağlantı URL'i | `tcp://127.0.0.1:5762` | `tcp://127.0.0.1:5773` |
 | Target System ID | `1` | `1` |
 | ROS 2 namespace | `/vtol_1` | `/vtol_2` |
+| Kalkış / Seyir irtifası | `20.0 m` / `46.0 m` | `30.0 m` / `60.0 m` |
 
-### Başlatma sıralaması
+### Başlatma Sıralaması ve FastDDS Loopback
 
-ArduPilot SITL'in TCP sunucusunu başlatması ve EKF sensör hizalamasını tamamlaması yaklaşık **10–12 saniye** sürebilir.
+ArduPilot SITL'in TCP sunucusunu başlatması ve EKF sensör hizalamasını tamamlaması yaklaşık **10–12 saniye** sürebilir. `Connection refused` ve `link down` gibi bağlantı hatalarını önlemek amacıyla MAVROS düğümleri, launch dosyasında `TimerAction` kullanılarak **12 saniye** gecikmeli başlatılır.
 
-`Connection refused` ve `link down` gibi bağlantı hatalarını önlemek amacıyla MAVROS düğümleri, launch dosyasında `TimerAction` kullanılarak 12 saniye gecikmeli başlatılır.
-
-> **Not:** Başlatma gecikmesi, SITL'in her koşulda hazır olduğunu garanti etmez. Daha sağlam bir yapı için bağlantı ve araç hazır olma durumlarının kontrol edilmesi önerilir.
+Konteyner içi düğümler arası topic ve servis keşfinin kararlı çalışması için `FASTRTPS_DEFAULT_PROFILES_FILE` üzerinden UDP loopback profili (`fastdds_udp_loopback.xml`) kullanılır.
 
 ---
 
-## 2. Ön Koşullar ve Bağımlılıklar
+## 2. Otonom Görev Mimarisi (`multi_vtol_commander`) ve Tasarım Kararları
+
+`vtol_bringup` paketi içerisindeki `multi_vtol_commander` düğümü, `vtol_1` ve `vtol_2` araçlarını birbirinden bağımsız `VehicleCommander` durum makineleri olarak yönetir.
+
+### 2.1. Görev Yaşam Döngüsü (State Machine)
+
+Her araç aşağıdaki fazları otonom olarak yürütür:
+
+```text
+WAIT_FCU -> SET_GUIDED -> ARM -> SPOOL_UP -> TAKEOFF -> WAIT_ALTITUDE
+   -> NAVIGATING (Çoklu Tur Rota Takibi)
+   -> [Hedef Tespiti] INTERCEPT_TARGET -> PAYLOAD_DROP -> NAVIGATING (Kaldığı WP'den Devam)
+   -> RTL_LAND (QRTL) -> WAIT_LANDED -> MISSION_COMPLETE (GUIDED Bekleme Modu)
+```
+
+### 2.2. Tasarım Kararları
+
+#### Neden çoklu ajan (multi-agent) simülasyon kullanılıyor?
+
+- **Hava sahası gerçekçiliği:** Yarışma sahasında yalnızca kendi İHA'mız değil, diğer takımların İHA'ları da aynı anda havada bulunur. İkinci ajan (`vtol_2`), farklı irtifa ve rota katmanında uçarak sahadaki diğer hava araçlarını ve çoklu hava sahası trafiğini simüle eder.
+- **Görev paralelliği:** İki farklı aracın aynı anda farklı irtifalarda ve rotalarda test edilebilmesi, geliştirme ve doğrulama süresini kısaltır.
+
+#### Neden `MAV_CMD_DO_REPOSITION` (tek atımlık komut) kullanılıyor?
+
+ArduPlane sabit kanat (Fixed-Wing) modunda sürekli setpoint basılması, otopilotun VTOL-FW geçiş (transition) durumunu sıfırlamasına yol açar. Bu nedenle her waypoint geçişinde tek seferlik `MAV_CMD_DO_REPOSITION` (192) komutu gönderilir.
+
+#### Neden waypoint kabul yarıçapı (`wp_radius_m`) 55.0 m olarak belirlendi?
+
+ArduPlane GUIDED modda hedef noktayı bir loiter (yörünge) merkezi olarak yorumlar ve dönüş yarıçapı (varsayılan `WP_LOITER_RAD`) nedeniyle merkeze ~50 metreden fazla yaklaşmadan teğet geçer. Yarıçapın 35.0 m gibi dar tutulması araçların waypoint etrafında sonsuz döngüye girmesine yol açtığından, akıcı ve kesintisiz tur geçişi için `suas_mission.json` içerisinde `wp_radius_m: 55.0` yapılandırılmıştır.
+
+#### Neden dinamik hedef kesmesi (Target Interrupt — Task 4 & Task 5) eklendi?
+
+Yarışmada İHA arama rotasında uçarken kamera/görüntü işleme hattı yerdeki hedefi (dağcı/valiz) tespit ettiğinde, aracın turunu bitirmesini beklemeden anında rotayı kesip hedefe yönelmesi gerekir.
+
+`/<ns>/target_gps` topic'ine `NavSatFix` mesajı geldiğinde araç:
+
+1. `NAVIGATING` fazını duraklatır,
+2. SUAS Task 5 kuralı gereği en az **150 ft AGL (≥ 48.0 m)** güvenli irtifada hedefe yaklaşır (`INTERCEPT_TARGET`),
+3. `DROP_RADIUS_M` (≤ 15 m / 50 ft) yarıçapı içinde faydalı yükü bırakır (`PAYLOAD_DROP`),
+4. Kaldığı waypoint'ten ana rotasına devam eder.
+
+#### Neden iniş sonrası (`MISSION_COMPLETE`) mod GUIDED yapılıyor?
+
+Araç `QRTL` ile dikey iniş yapıp disarm olduktan sonra `QRTL` modunda kalırsa otopilot periyodik olarak `PreArm: QRTL mode not armable` uyarısı üretir. İniş doğrulandığında (`alt < 0.4 m` veya disarmed) otopilot tek seferlik `GUIDED` moduna çekilerek sistem temiz bir bekleme durumuna alınır.
+
+---
+
+## 3. Ön Koşullar ve Bağımlılıklar
 
 Simülasyonu çalıştırmadan önce Docker konteynerinde aşağıdaki bileşenlerin kurulu ve yapılandırılmış olduğundan emin olun:
 
 - Gazebo Harmonic (GZ Sim 8)
 - ArduPilot SITL
 - ROS 2 Humble
-- MAVROS
-- MAVROS mesaj paketleri
+- MAVROS (`ros-humble-mavros`, `ros-humble-mavros-msgs`)
 - GeographicLib veri setleri
 - `colcon` derleme araçları
 - `vtol_bringup` ROS 2 paketi
 
 ### MAVROS kurulumu
 
-Konteyner içerisinde aşağıdaki komutları çalıştırın:
-
 ```bash
 sudo apt-get update
-
-sudo apt-get install -y \
-    ros-humble-mavros \
-    ros-humble-mavros-msgs
-
+sudo apt-get install -y ros-humble-mavros ros-humble-mavros-msgs
 sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh
 ```
 
 ---
 
-## 3. Kurulum ve Çalıştırma
+## 4. Kurulum, Derleme ve Çalıştırma
 
 Simülasyon ortamı, `vtol_sim` isimli Docker konteyneri içerisinde çalıştırılır.
 
-### Adım 1: Docker konteynerine bağlanma
-
-Host makinede terminal açın ve konteynere bağlanın:
+### Adım 1: Konteynere bağlanma ve paketi derleme
 
 ```bash
 docker exec -it vtol_sim bash
-```
-
-### Adım 2: ROS 2 çalışma alanını derleme
-
-Konteyner içerisinde aşağıdaki komutları çalıştırın:
-
-```bash
 cd /home/uav/ros2_ws
-
 source /opt/ros/humble/setup.bash
-
-colcon build --packages-select vtol_bringup
-
+colcon build --packages-select vtol_bringup --symlink-install
 source install/setup.bash
 ```
 
-> **Not:** Bu derleme işleminin ilk kurulumda veya `vtol_bringup` paketinde değişiklik yapıldığında gerçekleştirilmesi gerekir.
-
-### Adım 3: Simülasyonu başlatma
-
-Simülasyonu başlatmak için aynı konteyner terminalinde şu komutları çalıştırın:
+### Adım 2: Simülasyonu başlatma (Terminal 1)
 
 ```bash
 source /opt/ros/humble/setup.bash
-
 source /home/uav/ros2_ws/install/setup.bash
-
 export GZ_IP=127.0.0.1
+export FASTRTPS_DEFAULT_PROFILES_FILE=/home/uav/ros2_ws/install/vtol_bringup/share/vtol_bringup/config/fastdds_udp_loopback.xml
 
 ros2 launch vtol_bringup sim.launch.py
 ```
 
-Bu launch dosyası yapılandırmasına bağlı olarak aşağıdaki bileşenler başlatılır:
+**Doğrulama:** Gazebo penceresi açılır, iki VTOL uçağı pistte görünür ve yaklaşık 12 saniye sonra MAVROS bağlantıları kurulur.
 
-- Gazebo simülasyon ortamı
-- `vtol_1` için ArduPlane SITL instance'ı
-- `vtol_2` için ArduPlane SITL instance'ı
-- Her İHA için bağımsız MAVROS bağlantısı
-- ROS 2 üzerinden telemetri ve kontrol arayüzleri
+### Adım 3: Otonom görev yöneticisini başlatma (Terminal 2)
 
----
-
-## 4. Telemetri ve Veri Akışını Doğrulama
-
-Simülasyon çalışırken yeni bir host terminali açın ve ikinci terminali konteynere bağlayın:
-
-```bash
-docker exec -it vtol_sim bash
-```
-
-ROS 2 ortamını yükleyin:
+Yeni bir terminal sekmesi açın (konteyner içindeyseniz doğrudan devam edin):
 
 ```bash
 source /opt/ros/humble/setup.bash
-
 source /home/uav/ros2_ws/install/setup.bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=/home/uav/ros2_ws/install/vtol_bringup/share/vtol_bringup/config/fastdds_udp_loopback.xml
+
+ros2 run vtol_bringup multi_vtol_commander
 ```
 
-### VTOL 1 bağlantı kontrolü
+**Doğrulama:**
 
-```bash
-ros2 topic echo /vtol_1/mavros/state --once
-```
-
-Beklenen temel alanlar:
-
-```yaml
-connected: true
-mode: FBWA
-```
-
-`connected: true` değeri, MAVROS'un otopilot bağlantısını algıladığını gösterir. `FBWA` ise beklenen başlangıç uçuş modu olarak belirtilmiştir; gerçek değer yapılandırmaya ve mevcut uçuş durumuna bağlıdır.
-
-Yerel konum verisini kontrol edin:
-
-```bash
-ros2 topic echo /vtol_1/mavros/global_position/local --once
-```
-
-### VTOL 2 bağlantı kontrolü
-
-```bash
-ros2 topic echo /vtol_2/mavros/state --once
-```
-
-Beklenen temel alanlar:
-
-```yaml
-connected: true
-mode: FBWA
-```
-
-Yerel konum verisini kontrol edin:
-
-```bash
-ros2 topic echo /vtol_2/mavros/global_position/local --once
-```
-
-> **Önemli:** Topic isimleri ve mesaj türleri kullanılan MAVROS yapılandırmasıyla eşleşmelidir. Bağlantı veya veri akışı sorunu yaşanırsa `ros2 topic list` ve `ros2 topic info` komutlarıyla mevcut topic'leri ve mesaj türlerini doğrulayın.
+- Her iki araç `GUIDED` moda geçer, ARM olur ve hedef kalkış irtifalarına (20 m ve 30 m) tırmanır.
+- Sabit kanat (Fixed-Wing) geçişi tamamlandıktan sonra `[Tur 1/2 | WP 1/4]` loglarıyla rota takibi başlar.
+- 2 tur tamamlandığında `QRTL` aktif olur ve araçlar kalkış noktalarına dikey iniş yaparak `=== OTONOM İNİŞ TAMAMLANDI! GÖREV BAŞARIYLA BİTTİ ===` mesajını basar.
 
 ---
 
-## 5. Otonom Kontrol ve Sürü Yazılımı Arayüzleri
+## 5. Hedef Kesmesi ve Faydalı Yük Bırakma Testi (Task 4 & Task 5)
 
-Sürü algoritmaları ve otonom görev planlayıcıları, her İHA'ya kendi ROS 2 namespace'i üzerinden erişebilir.
+Uçaklar havada rota turundayken (`[Tur 1/2 | WP ...]` logları akarken), görüntü işleme düğümünden gelen hedef tespitini simüle etmek için üçüncü bir terminal açıp `/vtol_1/target_gps` topic'ine koordinat yayınlayabilirsiniz.
 
-### 5.1. Temel topic'ler
-
-| İşlev | VTOL 1 | VTOL 2 |
-|---|---|---|
-| Yerel konum / odometri | `/vtol_1/mavros/global_position/local` | `/vtol_2/mavros/global_position/local` |
-| Küresel GPS konumu | `/vtol_1/mavros/global_position/global` | `/vtol_2/mavros/global_position/global` |
-| Yerel hedef konumu | `/vtol_1/mavros/setpoint_position/local` | `/vtol_2/mavros/setpoint_position/local` |
-
-| Topic | Mesaj türü |
-|---|---|
-| `mavros/global_position/local` | `nav_msgs/msg/Odometry` |
-| `mavros/global_position/global` | `sensor_msgs/msg/NavSatFix` |
-| `mavros/setpoint_position/local` | `geometry_msgs/msg/PoseStamped` |
-
-Topic isimleri, namespace'in önüne eklenmesiyle her İHA için bağımsız hale gelir.
-
-### 5.2. Temel servisler
-
-| İşlev | VTOL 1 | VTOL 2 |
-|---|---|---|
-| Motorları başlatma / durdurma (Arm/Disarm) | `/vtol_1/mavros/cmd/arming` | `/vtol_2/mavros/cmd/arming` |
-| Uçuş modu değiştirme | `/vtol_1/mavros/set_mode` | `/vtol_2/mavros/set_mode` |
-
-| Servis | Mesaj türü |
-|---|---|
-| `mavros/cmd/arming` | `mavros_msgs/srv/CommandBool` |
-| `mavros/set_mode` | `mavros_msgs/srv/SetMode` |
-
-Uçuş modu değiştirme servisi üzerinden `GUIDED`, `QLOITER` veya araç tarafından desteklenen diğer uygun modlar talep edilebilir. Modun başarıyla değişmesi, ArduPilot'un uçuş koşullarına ve mod gereksinimlerine bağlıdır.
-
-### 5.3. Kullanım örnekleri
-
-VTOL 1'in durumunu sorgulama:
+> [!IMPORTANT]
+> Koordinatın simülasyon sahasına (Home GPS: `lat=-35.363262`, `lon=149.165237`) yakın olması gerekir. Dünya dışı veya binlerce kilometre uzak koordinatlar uçağın görev sahasından uzaklaşmasına neden olur.
 
 ```bash
-ros2 topic echo /vtol_1/mavros/state
-```
-
-VTOL 2'nin GPS verisini izleme:
-
-```bash
-ros2 topic echo /vtol_2/mavros/global_position/global
-```
-
-VTOL 1 için mevcut arming servis arayüzünü inceleme:
-
-```bash
-ros2 service info /vtol_1/mavros/cmd/arming
-```
-
-Mevcut topic ve servisleri listeleme:
-
-```bash
-ros2 topic list
-ros2 service list
-```
-
-> **Kontrol notu:** `setpoint_position/local` üzerinden hedef gönderirken uygun uçuş modunun etkin olması, setpoint mesajlarının gerekli hızda yayımlanması ve koordinat çerçevelerinin doğru kullanılması gerekir. Yalnızca topic'e mesaj göndermek, İHA'nın hedefe uçacağını garanti etmez.
-
----
-
-## 6. Simülasyonu Durdurma ve Süreç Temizliği
-
-Simülasyon terminalinde `Ctrl + C` kullanarak launch sürecini durdurun.
-
-Sonraki çalıştırmalarda `Address already in use` veya `Connection refused` gibi hatalarla karşılaşılması durumunda, konteyner içerisinde kalan süreçleri kontrol edin.
-
-### Süreçleri temizleme
-
-Aşağıdaki komut, belirtilen süreçleri zorla sonlandırır:
-
-```bash
-killall -9 gz sim_vehicle.py arduplane mavros_node parameter_bridge 2>/dev/null || true
-```
-
-> **Uyarı:** Bu komut, aynı isimli süreçlerin tümünü sonlandırabilir. Aynı konteynerde başka bir simülasyon çalışıyorsa bu süreçleri de etkileyebilir. Gerektiğinde önce `ps` veya `pgrep` ile çalışan süreçleri kontrol edin.
-
-### Hızlı yeniden başlatma
-
-Temizliğin ardından simülasyonu yeniden başlatmak için:
-
-```bash
-killall -9 gz sim_vehicle.py arduplane mavros_node parameter_bridge 2>/dev/null || true
-
 source /opt/ros/humble/setup.bash
-
 source /home/uav/ros2_ws/install/setup.bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=/home/uav/ros2_ws/install/vtol_bringup/share/vtol_bringup/config/fastdds_udp_loopback.xml
 
-export GZ_IP=127.0.0.1
+ros2 topic pub --once /vtol_1/target_gps sensor_msgs/msg/NavSatFix "{latitude: -35.3624, longitude: 149.1652, altitude: 50.0}"
+```
 
-ros2 launch vtol_bringup sim.launch.py
+### Doğrulama Adımları (Terminal 2 logları)
+
+1. `[vtol_1] [HEDEF TESPİT EDİLDİ!] Rota kesiliyor -> Dağcı/Hedef koordinatına yöneliniyor...` uyarısı görünür.
+2. `[HEDEF YAKLAŞMA - TASK 5]` satırlarında hedefe mesafenin azaldığı ve irtifanın `>= 48.0 m` (150 ft AGL) korunduğu izlenir.
+3. Hedef yarıçapına girildiğinde `>>> HEDEF ÜZERİNDE! ... -> FAYDALI YÜK BIRAKILIYOR! <<<` mesajı basılır.
+4. 2 saniye sonra `Faydalı yük başarıyla bırakıldı! Kaldığı yerden (WP X) rotaya devam ediliyor...` logu ile araç normal rota turuna geri döner.
+
+---
+
+## 6. ROS 2 Topic ve Servis Arayüzleri
+
+### 6.1. Temel Topic'ler
+
+| İşlev | VTOL 1 | VTOL 2 | Mesaj Türü |
+|---|---|---|---|
+| Otopilot durumu | `/vtol_1/mavros/state` | `/vtol_2/mavros/state` | `mavros_msgs/msg/State` |
+| Yerel konum / odometri | `/vtol_1/mavros/global_position/local` | `/vtol_2/mavros/global_position/local` | `nav_msgs/msg/Odometry` |
+| Küresel GPS konumu | `/vtol_1/mavros/global_position/global` | `/vtol_2/mavros/global_position/global` | `sensor_msgs/msg/NavSatFix` |
+| Hedef tespit kesmesi | `/vtol_1/target_gps` | `/vtol_2/target_gps` | `sensor_msgs/msg/NavSatFix` |
+
+### 6.2. Temel Servisler
+
+| İşlev | VTOL 1 | VTOL 2 | Mesaj Türü |
+|---|---|---|---|
+| Arm / Disarm | `/vtol_1/mavros/cmd/arming` | `/vtol_2/mavros/cmd/arming` | `mavros_msgs/srv/CommandBool` |
+| Uçuş modu değiştirme | `/vtol_1/mavros/set_mode` | `/vtol_2/mavros/set_mode` | `mavros_msgs/srv/SetMode` |
+| Dikey kalkış (Takeoff) | `/vtol_1/mavros/cmd/takeoff` | `/vtol_2/mavros/cmd/takeoff` | `mavros_msgs/srv/CommandTOL` |
+| Komut gönderimi (`DO_REPOSITION`) | `/vtol_1/mavros/cmd/command_int` | `/vtol_2/mavros/cmd/command_int` | `mavros_msgs/srv/CommandInt` |
+
+---
+
+## 7. Simülasyonu Durdurma ve Süreç Temizliği
+
+Simülasyon ve commander terminallerinde `Ctrl + C` kullandıktan sonra arka planda kalan süreçleri temizlemek için:
+
+```bash
+pkill -9 -f gz || true
+pkill -9 -f arduplane || true
+pkill -9 -f sim_vehicle || true
+pkill -9 -f mavros || true
+pkill -9 -f multi_vtol_commander || true
 ```
 
 ---
 
-## 7. Sorun Giderme
+## 8. Sorun Giderme
 
-| Hata / Belirti | Kontrol edilmesi gerekenler |
+| Hata / Belirti | Kontrol Edilmesi Gerekenler |
 |---|---|
-| `Connection refused` | SITL sürecinin çalıştığını, TCP portlarının dinlendiğini ve MAVROS bağlantı URL'lerinin doğru olduğunu kontrol edin. |
-| `link down` | SITL'in başlatılma süresini, TCP bağlantısını ve MAVROS loglarını kontrol edin. |
-| `connected: false` | İlgili MAVROS instance'ının doğru SITL portuna bağlandığını doğrulayın. |
-| Yerel konum verisi gelmiyor | İlgili topic'in varlığını, mesaj akışını ve EKF/GPS durumunu kontrol edin. |
-| `Address already in use` | İlgili portu kullanan süreçleri belirleyin ve yalnızca gerekli süreçleri sonlandırın. |
-| Uçuş modu değişmiyor | İstenen modun araç tarafından desteklendiğini ve geçiş koşullarının sağlandığını kontrol edin. |
-| Paket bulunamıyor | Çalışma alanını yeniden derleyin ve `install/setup.bash` dosyasını kaynak olarak yükleyin. |
+| `Connection refused` / `link down` | SITL'in 12 saniyelik başlangıç süresinin dolduğunu ve TCP portlarının (`5762`, `5773`) dinlendiğini doğrulayın. |
+| Topic'ler terminaller arası görünmüyor | Her terminalde `FASTRTPS_DEFAULT_PROFILES_FILE` değişkeninin `fastdds_udp_loopback.xml` dosyasına işaret ettiğinden emin olun. |
+| Araç waypoint etrafında dönüp ilerlemiyor | `suas_mission.json` içindeki `wp_radius_m` değerinin `55.0` olduğunu ve değişiklik sonrası `colcon build` alındığını kontrol edin. |
+| Hedef testinde mesafe binlerce km görünüyor | `/vtol_1/target_gps` mesajında Home GPS (`-35.3632`, `149.1652`) çevresinde bir koordinat gönderdiğinizden emin olun. |
+| `Address already in use` | [Bölüm 7](#7-simülasyonu-durdurma-ve-süreç-temizliği)'deki süreç temizleme komutlarını çalıştırıp eski SITL/Gazebo süreçlerini sonlandırın. |
 
 ---
 
-## 8. Projenin Amacı
+## 9. Kamera Entegrasyonu ve Ek Dokümantasyon
 
-Bu altyapı, çoklu VTOL sistemlerinin simülasyon ortamında geliştirilmesini ve test edilmesini kolaylaştırmak amacıyla tasarlanmıştır.
-
-Başlıca kullanım alanları:
-
-- Çoklu İHA telemetrisi ve durum takibi
-- Bağımsız araç kontrolü
-- Otonom görev planlama
-- Sürü koordinasyonu ve çoklu ajan algoritmaları
-- ROS 2 tabanlı kontrol yazılımlarının geliştirilmesi
-- Simülasyon ortamında uçuş senaryolarının test edilmesi
-
-**Temel hedef:** İki bağımsız VTOL aracının Gazebo, ArduPilot SITL ve ROS 2/MAVROS entegrasyonu üzerinden tek bir simülasyon ortamında çalıştırılması ve merkezi bir yazılım tarafından koordine edilebilmesidir.
-
-
----
-
-## Kamera Entegrasyonu
-
-Kamera entegrasyonuna ait kurulum ve kullanım bilgileri:
-
-- [Kamera Dokümantasyonu](docs/README_camera.md)
-- [Çoklu VTOL Dokümantasyonu](docs/README_multi_agent.md)
-
-Not: Kamera özelliklerinin iki VTOL ile birlikte çalışması
-entegrasyon testleri tamamlandıktan sonra doğrulanacaktır.
+- [Kamera Dokümantasyonu](docs/camera.md)
+- [Çoklu VTOL Dokümantasyonu](docs/multi_vtol.md)
