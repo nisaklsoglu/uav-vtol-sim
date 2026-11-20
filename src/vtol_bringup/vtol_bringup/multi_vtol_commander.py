@@ -21,6 +21,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import NavSatFix
+from vtol_bringup.ballistics import compute_ballistic_drop, spawn_payload_box
 
 
 class Phase(Enum):
@@ -92,6 +93,7 @@ class VehicleCommander:
         veh_cfg = mission_cfg.get(ns, {})
         self.takeoff_alt_m = float(veh_cfg.get('takeoff_alt_m', 20.0))
         self.enable_nfz = bool(mission_cfg.get('enable_nfz', True))
+        self.enable_ballistic_drop = bool(veh_cfg.get('enable_ballistic_drop', mission_cfg.get('enable_ballistic_drop', False)))
         if 'drop_radius_m' in mission_cfg:
             self.DROP_RADIUS_M = float(mission_cfg['drop_radius_m'])
         self.climb_verify_m = self.takeoff_alt_m * 0.8
@@ -748,6 +750,30 @@ class VehicleCommander:
                     f'İrtifa: {pos[2]:.1f}m (Min: {self.MIN_DROP_ALT_M:.1f}m)'
                 )
 
+            if self.enable_ballistic_drop:
+                vel_enu = (0.0, 0.0, 0.0)
+                if self.odom is not None:
+                    q = self.odom.pose.pose.orientation
+                    v = self.odom.twist.twist.linear
+                    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                    vx_e = v.x * math.cos(yaw) - v.y * math.sin(yaw)
+                    vy_e = v.x * math.sin(yaw) + v.y * math.cos(yaw)
+                    vel_enu = (vx_e, vy_e, v.z)
+                bal = compute_ballistic_drop(pos, vel_enu, (tx, ty))
+                if int(self._now().nanoseconds / 1e9) % 2 == 0:
+                    self.log.info(f'[{self.ns}] [BALİSTİK] Hata: {bal.impact_error_m:.1f}m | Lead: {bal.lead_distance_m:.1f}m | Hız: {bal.ground_speed_mps:.1f}m/s')
+                if bal.impact_error_m <= self.DROP_RADIUS_M and pos[2] >= 45.0:
+                    box_name = f'{self.ns}_payload_box'
+                    spawn_payload_box(box_name, pos)
+                    self.log.warn(
+                        f'[{self.ns}] >>> BALİSTİK BIRAKMA TETİKLENDİ! '
+                        f'Uçak Mesafe: {dist_2d:.1f}m | Lead: {bal.lead_distance_m:.1f}m | '
+                        f'Hız: {bal.ground_speed_mps:.1f}m/s | Düşüş Süresi: {bal.fall_time_s:.2f}s | '
+                        f'Tahmini Düşüş Hatası: {bal.impact_error_m:.2f}m <= {self.DROP_RADIUS_M:.1f}m <<<'
+                    )
+                    self._drop_deadline = self._now() + Duration(seconds=self.DROP_STABILIZE_SEC)
+                    self.phase = Phase.PAYLOAD_DROP
+                    return
             if dist_2d <= self.DROP_RADIUS_M and pos[2] >= 45.0:
                 self.log.warn(
                     f'[{self.ns}] >>> HEDEF ÜZERİNDE! (Mesafe: {dist_2d:.1f}m <= 50ft, '
@@ -828,6 +854,8 @@ class MultiVtolCommander(Node):
                 'case2_obstacles_separation': 'case2_obstacles_separation.json',
                 'case3': 'case3_target_drop.json',
                 'case3_target_drop': 'case3_target_drop.json',
+                'case4': 'case4_target_drop.json',
+                'case4_target_drop': 'case4_target_drop.json',
             }
             if case_param in case_map:
                 cfg_path = os.path.join(share_dir, 'config', 'cases', case_map[case_param])

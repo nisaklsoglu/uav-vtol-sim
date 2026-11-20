@@ -10,6 +10,9 @@ setup(
     version='0.1.0',
     packages=[package_name],
     data_files=[
+        ('share/' + package_name + '/launch', glob('launch/*.py')),
+        ('share/' + package_name + '/scripts', glob('scripts/*')),
+        ('share/' + package_name + '/worlds', glob('worlds/*')),
         ('share/' + package_name + '/config', [
             'config/sitl_no_prearm.parm',
             'config/suas_mission.json',
@@ -19,6 +22,7 @@ setup(
             'config/cases/case1_navigation.json',
             'config/cases/case2_obstacles_separation.json',
             'config/cases/case3_target_drop.json',
+            'config/cases/case4_target_drop.json',
         ]),
     ],
     install_requires=['setuptools'],
