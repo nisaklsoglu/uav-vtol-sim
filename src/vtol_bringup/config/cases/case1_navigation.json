@@ -1,0 +1,61 @@
+{
+  "wp_radius_m": 55.0,
+  "enable_fw_transition": true,
+  "vtol_1": {
+    "takeoff_alt_m": 20.0,
+    "laps": 2,
+    "waypoints": [
+      {
+        "x": 150.0,
+        "y": 0.0,
+        "z": 46.0
+      },
+      {
+        "x": 150.0,
+        "y": 150.0,
+        "z": 46.0
+      },
+      {
+        "x": 0.0,
+        "y": 150.0,
+        "z": 46.0
+      },
+      {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 46.0
+      }
+    ]
+  },
+  "vtol_2": {
+    "takeoff_alt_m": 30.0,
+    "laps": 2,
+    "waypoints": [
+      {
+        "x": 150.0,
+        "y": -50.0,
+        "z": 60.0
+      },
+      {
+        "x": 150.0,
+        "y": -200.0,
+        "z": 60.0
+      },
+      {
+        "x": 0.0,
+        "y": -200.0,
+        "z": 60.0
+      },
+      {
+        "x": 0.0,
+        "y": -50.0,
+        "z": 60.0
+      }
+    ]
+  },
+  "obstacles": [],
+  "case_name": "case1_navigation",
+  "enable_nfz": false,
+  "enable_separation": false,
+  "drop_radius_m": 15.0
+}

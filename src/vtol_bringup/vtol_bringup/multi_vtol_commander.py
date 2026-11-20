@@ -91,6 +91,9 @@ class VehicleCommander:
 
         veh_cfg = mission_cfg.get(ns, {})
         self.takeoff_alt_m = float(veh_cfg.get('takeoff_alt_m', 20.0))
+        self.enable_nfz = bool(mission_cfg.get('enable_nfz', True))
+        if 'drop_radius_m' in mission_cfg:
+            self.DROP_RADIUS_M = float(mission_cfg['drop_radius_m'])
         self.climb_verify_m = self.takeoff_alt_m * 0.8
         self.wp_radius_m = float(mission_cfg.get('wp_radius_m', 35.0))
         self.total_laps = int(veh_cfg.get('laps', 2))
@@ -126,6 +129,11 @@ class VehicleCommander:
         self._next_retry_time: Optional[Time] = None
         self._arm_service_ok = False
         self._post_land_reset = False
+
+        # Case 2: Statik NFZ (No-Fly Zone) & Inter-UAV Separation
+        self.obstacles: List[Dict] = mission_cfg.get('obstacles', [])
+        self.detour_wp: Optional[Tuple[float, float, float, float, float]] = None
+        self.avoiding_uav: bool = False
 
         prefix = f'/{ns}/mavros'
         sensor_qos = QoSProfile(
@@ -304,6 +312,53 @@ class VehicleCommander:
         self.log.info(
             f'[{self.ns}] Hazırlanan Global Rota: {len(self.waypoints)} WP, {self.total_laps} Tur, Yarıçap: {self.wp_radius_m}m'
         )
+
+    def _check_static_obstacles(
+        self,
+        pos: Tuple[float, float, float],
+        target_wp: Tuple[float, float, float, float, float],
+    ) -> Optional[Tuple[float, float, float, float, float]]:
+        """Rota cizgisi bir NFZ silindirini kesiyorsa guvenli teget kacis noktasi (detour) dondurur."""
+        if not self.enable_nfz or not self.obstacles or self.home_gps is None:
+            return None
+
+        px, py = pos[0], pos[1]
+        tx, ty, tz = target_wp[0], target_wp[1], target_wp[2]
+        vx, vy = tx - px, ty - py
+        seg_len = math.hypot(vx, vy)
+        if seg_len < 1.0:
+            return None
+
+        ux, uy = vx / seg_len, vy / seg_len
+        for obs in self.obstacles:
+            ox, oy = float(obs['x']), float(obs['y'])
+            r_safe = float(obs['radius']) + 20.0
+
+            # Engelin rota dogrultusundaki izdusumu
+            proj = (ox - px) * ux + (oy - py) * uy
+            if proj < 0.0 or proj > seg_len:
+                continue
+
+            # Engele olan dik mesafe ve ucağın engele mesafesi
+            closest_x = px + proj * ux
+            closest_y = py + proj * uy
+            perp_dist = math.hypot(ox - closest_x, oy - closest_y)
+            dist_to_obs = math.hypot(ox - px, oy - py)
+
+            if perp_dist < r_safe and dist_to_obs < 110.0:
+                # Engelin sol/sag dik vektorunden disari dogru 35m ofsetli kacis noktasi
+                nx, ny = -uy, ux
+                if (closest_x - ox) * nx + (closest_y - oy) * ny < 0.0:
+                    nx, ny = -nx, -ny
+                dx = ox + nx * (float(obs['radius']) + 35.0)
+                dy = oy + ny * (float(obs['radius']) + 35.0)
+                d_lat, d_lon = enu_to_gps(dx, dy, float(self.home_gps.latitude), float(self.home_gps.longitude))
+                self.log.warn(
+                    f"[{self.ns}] [NFZ KAÇINMA] {obs.get('name', 'NFZ')} tespit edildi! "
+                    f"Teğet noktaya yöneliniyor: ENU=({dx:.1f}m, {dy:.1f}m)"
+                )
+                return (dx, dy, tz, d_lat, d_lon)
+        return None
 
     def _compute_cross_track_error(
         self,
@@ -610,6 +665,26 @@ class VehicleCommander:
                 return
 
             target_wp = self.waypoints[self.current_wp_idx]
+
+            # Statik NFZ kacisma aktifse once detour noktasini tamamla
+            if self.detour_wp is not None:
+                d_dist = math.hypot(self.detour_wp[0] - pos[0], self.detour_wp[1] - pos[1])
+                detour_radius = max(self.wp_radius_m, 65.0)
+                if d_dist <= detour_radius:
+                    self.log.info(
+                        f'[{self.ns}] [NFZ KAÇINMA] Engel geçildi (mesafe={d_dist:.1f}m) -> '
+                        f'Ana WP {self.current_wp_idx + 1} hedefine dönülüyor.'
+                    )
+                    self.prev_wp_enu = (self.detour_wp[0], self.detour_wp[1], self.detour_wp[2])
+                    self.detour_wp = None
+                    self._send_reposition_once(target_wp[3], target_wp[4], target_wp[2])
+                return
+
+            detour = self._check_static_obstacles(pos, target_wp)
+            if detour is not None:
+                self.detour_wp = detour
+                self._send_wp_with_overshoot(pos, detour, overshoot_m=45.0)
+                return
             dist_2d = math.hypot(target_wp[0] - pos[0], target_wp[1] - pos[1])
             xte = self._compute_cross_track_error(
                 pos, self.prev_wp_enu, (target_wp[0], target_wp[1], target_wp[2])
@@ -728,8 +803,10 @@ class VehicleCommander:
 class MultiVtolCommander(Node):
     def __init__(self):
         super().__init__('multi_vtol_commander')
+        self.declare_parameter('case', '')
         self._cb_group = ReentrantCallbackGroup()
         mission_cfg = self._load_mission_config()
+        self.enable_separation = bool(mission_cfg.get('enable_separation', True))
 
         self.vehicles = [
             VehicleCommander(self, 'vtol_1', self._cb_group, mission_cfg),
@@ -743,7 +820,19 @@ class MultiVtolCommander(Node):
     def _load_mission_config(self) -> Dict:
         try:
             share_dir = get_package_share_directory('vtol_bringup')
-            cfg_path = os.path.join(share_dir, 'config', 'suas_mission.json')
+            case_param = str(self.get_parameter('case').value or '').strip().lower()
+            case_map = {
+                'case1': 'case1_navigation.json',
+                'case1_navigation': 'case1_navigation.json',
+                'case2': 'case2_obstacles_separation.json',
+                'case2_obstacles_separation': 'case2_obstacles_separation.json',
+                'case3': 'case3_target_drop.json',
+                'case3_target_drop': 'case3_target_drop.json',
+            }
+            if case_param in case_map:
+                cfg_path = os.path.join(share_dir, 'config', 'cases', case_map[case_param])
+            else:
+                cfg_path = os.path.join(share_dir, 'config', 'suas_mission.json')
             if os.path.exists(cfg_path):
                 with open(cfg_path, 'r', encoding='utf-8') as f:
                     self.get_logger().info(f'Görev dosyası yüklendi: {cfg_path}')
@@ -775,7 +864,45 @@ class MultiVtolCommander(Node):
             },
         }
 
+    def _check_inter_uav_separation(self) -> None:
+        if not getattr(self, 'enable_separation', True) or len(self.vehicles) < 2:
+            return
+        v1, v2 = self.vehicles[0], self.vehicles[1]
+        active_phases = (Phase.NAVIGATING, Phase.INTERCEPT_TARGET)
+        if v1.phase not in active_phases or v2.phase not in active_phases:
+            return
+        if v1.curr_gps is None or v2.curr_gps is None:
+            return
+        p1, p2 = v1._position_enu(), v2._position_enu()
+        if p1 is None or p2 is None:
+            return
+
+        dx, dy = gps_to_enu(
+            v2.curr_gps.latitude, v2.curr_gps.longitude,
+            v1.curr_gps.latitude, v1.curr_gps.longitude
+        )
+        horiz_dist = math.hypot(dx, dy)
+        vert_dist = abs(p1[2] - p2[2])
+
+        if not v2.avoiding_uav and horiz_dist < 45.0 and vert_dist < 12.0:
+            v2.avoiding_uav = True
+            target_wp = v2.waypoints[v2.current_wp_idx]
+            safe_alt = max(p1[2], target_wp[2]) + 15.0
+            self.get_logger().warn(
+                f'[SEPARATION] vtol_1 - vtol_2 yakınlaşma! '
+                f'(Yatay: {horiz_dist:.1f}m, Dikey: {vert_dist:.1f}m) -> vtol_2 {safe_alt:.1f}m irtifaya tırmanıyor.'
+            )
+            v2._send_reposition_once(target_wp[3], target_wp[4], safe_alt)
+        elif v2.avoiding_uav and horiz_dist > 65.0:
+            v2.avoiding_uav = False
+            target_wp = v2.waypoints[v2.current_wp_idx]
+            self.get_logger().info(
+                f'[SEPARATION] Güvenli ayrım sağlandı ({horiz_dist:.1f}m) -> vtol_2 normal irtifaya ({target_wp[2]:.1f}m) dönüyor.'
+            )
+            v2._send_reposition_once(target_wp[3], target_wp[4], target_wp[2])
+
     def _on_timer(self) -> None:
+        self._check_inter_uav_separation()
         for vehicle in self.vehicles:
             try:
                 vehicle.tick()

@@ -10,12 +10,16 @@ setup(
     version='0.1.0',
     packages=[package_name],
     data_files=[
-        ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        (os.path.join('share', package_name, 'config'), glob('config/*')),
-        (os.path.join('share', package_name, 'worlds'), glob('worlds/*')),
-        (os.path.join('share', package_name, 'scripts'), glob('scripts/*')),
+        ('share/' + package_name + '/config', [
+            'config/sitl_no_prearm.parm',
+            'config/suas_mission.json',
+            'config/fastdds_udp_loopback.xml',
+        ]),
+        ('share/' + package_name + '/config/cases', [
+            'config/cases/case1_navigation.json',
+            'config/cases/case2_obstacles_separation.json',
+            'config/cases/case3_target_drop.json',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
