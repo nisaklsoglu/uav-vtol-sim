@@ -107,6 +107,7 @@ Testlerin birbirini ezmemesi ve her görevin izole şekilde çalıştırılabilm
 | `case1` (`case1_navigation`) | `case1_navigation.json` | `false` | `false` | `15.0` | Saf rota takibi (2 tur), XTE ölçümü ve QRTL iniş testi |
 | `case2` (`case2_obstacles_separation`) | `case2_obstacles_separation.json` | `true` | `true` | `15.0` | Statik NFZ (`NFZ_1`) teğet dolanma ve `vtol_1`–`vtol_2` hava sahası ayrımı |
 | `case3` (`case3_target_drop`) | `case3_target_drop.json` | `false` | `false` | `35.0` | Dinamik `/target_gps` kesmesi, 150 ft AGL irtifa kontrolü ve yük bırakma testi |
+| `case4` (`case4_target_drop`) | `case4_target_drop.json` | `false` | `false` | — | Balistik lead/hız hesabı ile hedefe yaklaşma ve faydalı yük bırakma testi |
 
 > **Not:** `setup.py` içerisinde `config/cases/*` dosyaları `share/<package_name>/config/cases` altına açıkça kurulacak şekilde tanımlanmıştır; böylece `colcon build` sırasında klasör kopyalama hatası oluşmaz.
 
@@ -224,6 +225,25 @@ ros2 topic pub --once /vtol_1/target_gps sensor_msgs/msg/NavSatFix "{latitude: -
 2. `[HEDEF YAKLAŞMA - TASK 5]` ile `>= 48.0 m` (150 ft AGL) irtifada yaklaşma,
 3. Hedef yarıçapına girildiğinde `FAYDALI YÜK BIRAKILIYOR!`,
 4. 2 saniye sonra kalınan waypoint'ten rotaya devam.
+
+
+
+### 6.4. Case 4 — Balistik Hedef Bırakma Testi
+
+Terminal 2'de `case4` ile commander'ı başlatın:
+
+```bash
+ros2 run vtol_bringup multi_vtol_commander --ros-args -p case:=case4
+```
+`vtol_1` `NAVIGATING` fazındayken üçüncü terminalden hedef koordinatı yayınlayın:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/uav/ros2_ws/install/setup.bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=/home/uav/ros2_ws/install/vtol_bringup/share/vtol_bringup/config/fastdds_udp_loopback.xml
+
+ros2 topic pub --times 5 /vtol_1/target_gps sensor_msgs/msg/NavSatFix "{latitude: -35.3624, longitude: 149.1652, altitude: 50.0}"
+```
 
 ---
 
